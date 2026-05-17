@@ -364,6 +364,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   late final Stream<List<Map<String, dynamic>>> _membershipStream;
   Timer? _homeRefreshFallbackTimer;
   Timer? _iosBluetoothKeepAliveTimer;
+  Timer? _iosBackgroundHeartbeatTimer;
   bool _btBootstrapping = false;
   String? _btError;
   List<Device> _nearbyDevices = const [];
@@ -386,6 +387,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   bool _btNotifDedupeLoaded = false;
   bool get _isApplePeerSupported => Platform.isIOS || Platform.isMacOS;
   DateTime _lastRealtimeResubscribeAt = DateTime.fromMillisecondsSinceEpoch(0);
+  final _iosBackgroundBridge = IOSBackgroundTaskBridge();
 
   String get _currentUserId => _client.auth.currentUser!.id;
 
@@ -524,6 +526,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     WidgetsBinding.instance.removeObserver(_lifecycleObserver);
     _homeRefreshFallbackTimer?.cancel();
     _iosBluetoothKeepAliveTimer?.cancel();
+    _iosBackgroundHeartbeatTimer?.cancel();
     _btIncomingSub?.cancel();
     if (_messageNotificationsChannel != null) {
       _client.removeChannel(_messageNotificationsChannel!);
@@ -531,6 +534,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     _stopIncomingCallTone();
     _incomingCallTonePlayer.dispose();
     if (_isApplePeerSupported) {
+      _stopIOSBackgroundExecution();
       _bluetoothService.stop();
     }
     super.dispose();
@@ -910,7 +914,8 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       try {
         await _bluetoothService.refreshPresence();
       } catch (_) {}
-      if (_nearbyDevices.isEmpty) {
+      if (_appLifecycleState == AppLifecycleState.resumed &&
+          _nearbyDevices.isEmpty) {
         await _refreshAdvertising(force: true);
       }
     });
@@ -918,6 +923,12 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
 
   Future<void> _refreshAdvertising({bool force = false}) async {
     if (!_isApplePeerSupported) return;
+    if (_appLifecycleState != AppLifecycleState.resumed) {
+      try {
+        await _bluetoothService.refreshPresence();
+      } catch (_) {}
+      return;
+    }
     final inactivitySeconds = DateTime.now()
         .difference(_bluetoothService.lastActivityAt)
         .inSeconds;
@@ -934,21 +945,54 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     } catch (_) {}
   }
 
+  Future<void> _startIOSBackgroundExecution() async {
+    if (!Platform.isIOS) return;
+    try {
+      await _iosBackgroundBridge.start();
+    } catch (_) {}
+    _iosBackgroundHeartbeatTimer?.cancel();
+    _iosBackgroundHeartbeatTimer = Timer.periodic(const Duration(seconds: 12), (
+      _,
+    ) async {
+      if (_appLifecycleState == AppLifecycleState.resumed) return;
+      try {
+        await _bluetoothService.refreshPresence();
+      } catch (_) {}
+    });
+  }
+
+  Future<void> _stopIOSBackgroundExecution() async {
+    _iosBackgroundHeartbeatTimer?.cancel();
+    _iosBackgroundHeartbeatTimer = null;
+    if (!Platform.isIOS) return;
+    try {
+      await _iosBackgroundBridge.stop();
+    } catch (_) {}
+  }
+
   late final WidgetsBindingObserver _lifecycleObserver = _LifecycleObserver(
     onChanged: (state) async {
       _appLifecycleState = state;
       if (!mounted) return;
       if (state == AppLifecycleState.resumed) {
+        await _stopIOSBackgroundExecution();
         _resubscribeMessageNotifications();
       }
       await _broadcastBluetoothPresence();
       if (!_isApplePeerSupported) return;
-      if (state == AppLifecycleState.resumed ||
-          state == AppLifecycleState.inactive) {
+      if (state == AppLifecycleState.resumed) {
         try {
           await _bluetoothService.refreshPresence();
         } catch (_) {}
         await _refreshAdvertising(force: true);
+        return;
+      }
+      if (state == AppLifecycleState.inactive ||
+          state == AppLifecycleState.paused) {
+        await _startIOSBackgroundExecution();
+        try {
+          await _bluetoothService.refreshPresence();
+        } catch (_) {}
       }
     },
   );
@@ -3169,6 +3213,15 @@ class MacNearbyChannelBridge {
       message: map['message']?.toString() ?? '',
     );
   }
+}
+
+class IOSBackgroundTaskBridge {
+  static const MethodChannel _channel = MethodChannel(
+    'vmessages/ios_background_task',
+  );
+
+  Future<void> start() => _channel.invokeMethod('start');
+  Future<void> stop() => _channel.invokeMethod('stop');
 }
 
 class BluetoothIncomingMessage {
