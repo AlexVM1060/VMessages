@@ -384,7 +384,10 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   final Set<String> _recentNotifiedMessageIds = <String>{};
   final List<String> _recentBtNotificationKeys = <String>[];
   static const String _btNotifDedupePrefsKey = 'bt_notif_dedupe_keys_v1';
+  static const String _pendingWalkieInvitePrefsKey = 'bt_pending_walkie_invite_v1';
   bool _btNotifDedupeLoaded = false;
+  Map<String, String>? _pendingWalkieInvite;
+  bool _walkieInviteDialogOpen = false;
   bool get _isApplePeerSupported => Platform.isIOS || Platform.isMacOS;
   DateTime _lastRealtimeResubscribeAt = DateTime.fromMillisecondsSinceEpoch(0);
   final _iosBackgroundBridge = IOSBackgroundTaskBridge();
@@ -517,6 +520,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     _startBluetoothKeepAlive();
     _loadNearbyChatMeta();
     _loadBtNotificationDedupeCache();
+    _loadPendingWalkieInvite();
     _requestNotificationPermissions();
     _resubscribeMessageNotifications(force: true);
   }
@@ -826,6 +830,112 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     } catch (_) {}
   }
 
+  Future<void> _loadPendingWalkieInvite() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_pendingWalkieInvitePrefsKey);
+      if (raw == null || raw.trim().isEmpty) return;
+      final map = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+      final deviceId = map['deviceId']?.toString().trim() ?? '';
+      if (deviceId.isEmpty) return;
+      _pendingWalkieInvite = <String, String>{
+        'deviceId': deviceId,
+        'inviteId': map['inviteId']?.toString().trim() ?? '',
+      };
+      if (mounted && _appLifecycleState == AppLifecycleState.resumed) {
+        unawaited(_presentPendingWalkieInviteIfNeeded());
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _savePendingWalkieInvite() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final pending = _pendingWalkieInvite;
+      if (pending == null) {
+        await prefs.remove(_pendingWalkieInvitePrefsKey);
+        return;
+      }
+      await prefs.setString(_pendingWalkieInvitePrefsKey, jsonEncode(pending));
+    } catch (_) {}
+  }
+
+  String _peerLabelFromDeviceId(String deviceId) {
+    final cleanId = deviceId.trim();
+    if (cleanId.isEmpty) return 'Bluetooth';
+    final fromLive = _nearbyDevices.where((d) => d.deviceId.trim() == cleanId);
+    if (fromLive.isNotEmpty) {
+      final peer = fromLive.first;
+      final name = peer.deviceName.trim();
+      if (name.isNotEmpty) return name;
+    }
+    final fromRecent = _recentNearbyDevicesById[cleanId];
+    if (fromRecent != null) {
+      final name = fromRecent.deviceName.trim();
+      if (name.isNotEmpty) return name;
+    }
+    return cleanId;
+  }
+
+  Future<void> _presentPendingWalkieInviteIfNeeded() async {
+    if (!mounted) return;
+    if (_appLifecycleState != AppLifecycleState.resumed) return;
+    if (_walkieInviteDialogOpen) return;
+    final pending = _pendingWalkieInvite;
+    if (pending == null) return;
+    final deviceId = pending['deviceId']?.trim() ?? '';
+    if (deviceId.isEmpty) return;
+
+    _walkieInviteDialogOpen = true;
+    final peerName = _peerLabelFromDeviceId(deviceId);
+    final decision = await showCupertinoDialog<String>(
+      context: context,
+      builder: (dialogContext) => CupertinoAlertDialog(
+        title: const Text('Walkie Talkie'),
+        content: Text('$peerName quiere hacer Walkie Talkie contigo. ¿Quieres unirte?'),
+        actions: [
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.of(dialogContext).pop('reject'),
+            child: const Text('Rechazar'),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(dialogContext).pop('accept'),
+            child: const Text('Aceptar'),
+          ),
+        ],
+      ),
+    );
+    _walkieInviteDialogOpen = false;
+    if (!mounted) return;
+
+    final inviteId = pending['inviteId']?.trim() ?? '';
+    _pendingWalkieInvite = null;
+    await _savePendingWalkieInvite();
+    if (!mounted) return;
+
+    if (decision == 'accept') {
+      await Navigator.of(context, rootNavigator: true).push(
+        CupertinoPageRoute<void>(
+          builder: (_) => WalkieTalkieScreen(
+            service: _bluetoothService,
+            deviceId: deviceId,
+            peerName: peerName,
+            sendStartSignalOnOpen: false,
+            inviteId: inviteId,
+            isJoiner: true,
+          ),
+        ),
+      );
+    } else {
+      await _bluetoothService.sendText(
+        deviceId,
+        'btcall::${jsonEncode({'type': 'end', 'inviteId': inviteId})}',
+      );
+    }
+  }
+
   String _buildBluetoothNotificationKey({
     required String deviceId,
     required String body,
@@ -1061,6 +1171,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       if (state == AppLifecycleState.resumed) {
         await _stopIOSBackgroundExecution();
         _resubscribeMessageNotifications();
+        unawaited(_presentPendingWalkieInviteIfNeeded());
       }
       await _broadcastBluetoothPresence();
       if (!_isApplePeerSupported) return;
@@ -1335,6 +1446,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       final type = map['type']?.toString() ?? '';
       if (type != 'start') return true;
       final resolvedId = _resolveNearbyDeviceId(incomingDeviceId);
+      final inviteId = map['inviteId']?.toString().trim() ?? '';
       await _showBluetoothEventNotificationIfNeeded(
         deviceId: resolvedId,
         eventType: 'btwalkie_invite',
@@ -1342,6 +1454,13 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         body: 'Quiere hablar contigo',
         rawIncoming: body,
       );
+      if (_appLifecycleState != AppLifecycleState.resumed) {
+        _pendingWalkieInvite = <String, String>{
+          'deviceId': resolvedId,
+          'inviteId': inviteId,
+        };
+        await _savePendingWalkieInvite();
+      }
       return true;
     } catch (_) {
       return true;
@@ -3399,6 +3518,7 @@ class _BluetoothConversationScreenState
   String? _playingMessageId;
   bool _showWalkieInvite = false;
   bool _peerInBluetoothCall = false;
+  String _incomingWalkieInviteId = '';
   bool _showVoiceCallInvite = false;
   String _peerPresence = 'online';
   bool _peerTyping = false;
@@ -3787,14 +3907,17 @@ class _BluetoothConversationScreenState
         final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
         final type = map['type']?.toString() ?? '';
         if (type == 'start') {
+          final inviteId = map['inviteId']?.toString().trim() ?? '';
           setState(() {
             _showWalkieInvite = true;
             _peerInBluetoothCall = true;
+            _incomingWalkieInviteId = inviteId;
           });
         } else if (type == 'end') {
           setState(() {
             _showWalkieInvite = false;
             _peerInBluetoothCall = false;
+            _incomingWalkieInviteId = '';
           });
         }
       } catch (_) {}
@@ -3911,15 +4034,21 @@ class _BluetoothConversationScreenState
   }
 
   Future<void> _openWalkieTalkie({required bool isInitiator}) async {
+    String? sessionInviteId;
     if (isInitiator) {
       final targetId = _resolveOutgoingDeviceId();
       final inviteId = DateTime.now().microsecondsSinceEpoch.toString();
+      sessionInviteId = inviteId;
       final payload = 'btcall::${jsonEncode({'type': 'start', 'inviteId': inviteId})}';
       for (var i = 0; i < 3; i++) {
         Future<void>.delayed(Duration(milliseconds: i * 220), () {
           widget.service.sendText(targetId, payload);
         });
       }
+    } else {
+      sessionInviteId = _incomingWalkieInviteId.trim().isEmpty
+          ? null
+          : _incomingWalkieInviteId.trim();
     }
     if (!mounted) return;
     await Navigator.of(context).push(
@@ -3929,6 +4058,8 @@ class _BluetoothConversationScreenState
           deviceId: widget.deviceId,
           peerName: widget.peerName,
           sendStartSignalOnOpen: false,
+          inviteId: sessionInviteId,
+          isJoiner: !isInitiator,
         ),
       ),
     );
@@ -3936,6 +4067,7 @@ class _BluetoothConversationScreenState
     setState(() {
       _showWalkieInvite = false;
       _peerInBluetoothCall = false;
+      _incomingWalkieInviteId = '';
     });
   }
 
@@ -4852,12 +4984,16 @@ class WalkieTalkieScreen extends StatefulWidget {
     required this.deviceId,
     required this.peerName,
     required this.sendStartSignalOnOpen,
+    this.inviteId,
+    this.isJoiner = false,
   });
 
   final BluetoothNearbyService service;
   final String deviceId;
   final String peerName;
   final bool sendStartSignalOnOpen;
+  final String? inviteId;
+  final bool isJoiner;
 
   @override
   State<WalkieTalkieScreen> createState() => _WalkieTalkieScreenState();
@@ -5276,16 +5412,54 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
   Timer? _ticker;
   StreamSubscription<Amplitude>? _amplitudeSub;
   List<double> _spectrum = List<double>.filled(20, 0.08);
+  String _activeInviteId = '';
+  bool _peerReadyForPtt = false;
 
   @override
   void initState() {
     super.initState();
+    _activeInviteId = widget.inviteId?.trim() ?? '';
+    _peerReadyForPtt = widget.isJoiner;
     _incomingSub = widget.service.messagesStream.listen((event) {
       final raw = _extractBtEnvelopeVisibleText(event.message);
+      if (raw.startsWith('btcall::')) {
+        try {
+          final payload = raw.replaceFirst('btcall::', '');
+          final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+          final type = map['type']?.toString() ?? '';
+          final incomingInviteId = map['inviteId']?.toString().trim() ?? '';
+          if (type == 'start' && _activeInviteId.isEmpty && incomingInviteId.isNotEmpty) {
+            _activeInviteId = incomingInviteId;
+          }
+          if (type == 'accept' &&
+              _activeInviteId.isNotEmpty &&
+              incomingInviteId.isNotEmpty &&
+              incomingInviteId != _activeInviteId) {
+            return;
+          }
+          if (type == 'accept' && mounted) {
+            setState(() {
+              _peerReadyForPtt = true;
+            });
+          }
+        } catch (_) {}
+        return;
+      }
       if (!raw.startsWith('btcallvoice::')) return;
       try {
         final payload = raw.replaceFirst('btcallvoice::', '');
         final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+        final incomingInviteId = map['inviteId']?.toString().trim() ?? '';
+        if (_activeInviteId.isNotEmpty &&
+            incomingInviteId.isNotEmpty &&
+            incomingInviteId != _activeInviteId) {
+          return;
+        }
+        if (!_peerReadyForPtt && mounted) {
+          setState(() {
+            _peerReadyForPtt = true;
+          });
+        }
         final bytesRaw = map['bytes']?.toString() ?? '';
         final durationRaw = map['durationMs']?.toString() ?? '0';
         if (bytesRaw.isEmpty) return;
@@ -5301,12 +5475,24 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
       } catch (_) {}
     });
     if (widget.sendStartSignalOnOpen) {
-      final inviteId = DateTime.now().microsecondsSinceEpoch.toString();
+      final inviteId = _activeInviteId.isEmpty
+          ? DateTime.now().microsecondsSinceEpoch.toString()
+          : _activeInviteId;
+      _activeInviteId = inviteId;
       final payload =
           'btcall::${jsonEncode({'type': 'start', 'inviteId': inviteId})}';
       for (var i = 0; i < 3; i++) {
         Future<void>.delayed(Duration(milliseconds: i * 220), () {
           widget.service.sendText(widget.deviceId, payload);
+        });
+      }
+    }
+    if (widget.isJoiner && _activeInviteId.isNotEmpty) {
+      final acceptPayload =
+          'btcall::${jsonEncode({'type': 'accept', 'inviteId': _activeInviteId})}';
+      for (var i = 0; i < 3; i++) {
+        Future<void>.delayed(Duration(milliseconds: i * 220), () {
+          widget.service.sendText(widget.deviceId, acceptPayload);
         });
       }
     }
@@ -5379,6 +5565,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
     final payload = jsonEncode({
       'bytes': base64Encode(bytes),
       'durationMs': durationMs,
+      'inviteId': _activeInviteId,
     });
     await widget.service.sendText(widget.deviceId, 'btcallvoice::$payload');
   }
@@ -5412,7 +5599,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
   void dispose() {
     widget.service.sendText(
       widget.deviceId,
-      'btcall::${jsonEncode({'type': 'end'})}',
+      'btcall::${jsonEncode({'type': 'end', 'inviteId': _activeInviteId})}',
     );
     _incomingSub?.cancel();
     _ticker?.cancel();
@@ -5434,7 +5621,11 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
           children: [
             const SizedBox(height: 26),
             Text(
-              _pttRecording ? 'Hablando...' : 'Mantén presionado para hablar',
+              _pttRecording
+                  ? 'Hablando...'
+                  : (_peerReadyForPtt
+                        ? 'Mantén presionado para hablar'
+                        : 'Esperando a que ${widget.peerName} entre al Walkie Talkie...'),
               style: const TextStyle(fontSize: 15, color: Color(0xFF636366)),
             ),
             const SizedBox(height: 14),
@@ -5455,39 +5646,42 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
               ),
             ),
             const Spacer(),
-            GestureDetector(
-              onLongPressStart: (_) => _startPtt(),
-              onLongPressEnd: (_) => _stopPtt(),
-              onLongPressCancel: _stopPtt,
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 140),
-                width: _pttRecording ? 132 : 116,
-                height: _pttRecording ? 132 : 116,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: _pttRecording
-                      ? const Color(0xFFFF3B30)
-                      : const Color(0xFF0A84FF),
-                  boxShadow: [
-                    BoxShadow(
-                      color:
-                          (_pttRecording
-                                  ? const Color(0xFFFF3B30)
-                                  : const Color(0xFF0A84FF))
-                              .withValues(alpha: 0.30),
-                      blurRadius: 24,
-                      spreadRadius: 2,
-                    ),
-                  ],
+            if (_peerReadyForPtt)
+              GestureDetector(
+                onLongPressStart: (_) => _startPtt(),
+                onLongPressEnd: (_) => _stopPtt(),
+                onLongPressCancel: _stopPtt,
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 140),
+                  width: _pttRecording ? 132 : 116,
+                  height: _pttRecording ? 132 : 116,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _pttRecording
+                        ? const Color(0xFFFF3B30)
+                        : const Color(0xFF0A84FF),
+                    boxShadow: [
+                      BoxShadow(
+                        color:
+                            (_pttRecording
+                                    ? const Color(0xFFFF3B30)
+                                    : const Color(0xFF0A84FF))
+                                .withValues(alpha: 0.30),
+                        blurRadius: 24,
+                        spreadRadius: 2,
+                      ),
+                    ],
+                  ),
+                  alignment: Alignment.center,
+                  child: const Icon(
+                    CupertinoIcons.mic_fill,
+                    size: 52,
+                    color: CupertinoColors.white,
+                  ),
                 ),
-                alignment: Alignment.center,
-                child: const Icon(
-                  CupertinoIcons.mic_fill,
-                  size: 52,
-                  color: CupertinoColors.white,
-                ),
-              ),
-            ),
+              )
+            else
+              const CupertinoActivityIndicator(radius: 16),
             const SizedBox(height: 36),
           ],
         ),
