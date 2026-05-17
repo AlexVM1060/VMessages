@@ -8,10 +8,12 @@ create table if not exists public.profiles (
   phone text unique,
   display_name text,
   access_code text,
+  avatar_url text,
   created_at timestamptz not null default now()
 );
 
 alter table public.profiles add column if not exists access_code text;
+alter table public.profiles add column if not exists avatar_url text;
 
 create table if not exists public.conversations (
   id uuid primary key default gen_random_uuid(),
@@ -226,4 +228,12 @@ create policy "chat_media_insert_authenticated"
   on storage.objects
   for insert
   to authenticated
+  with check (bucket_id = 'chat-media');
+
+drop policy if exists "chat_media_update_authenticated" on storage.objects;
+create policy "chat_media_update_authenticated"
+  on storage.objects
+  for update
+  to authenticated
+  using (bucket_id = 'chat-media')
   with check (bucket_id = 'chat-media');

@@ -161,7 +161,7 @@ class _PhonePasswordAuthScreenState extends State<PhonePasswordAuthScreen> {
 
     final profile = await Supabase.instance.client
         .from('profiles')
-        .select('access_code')
+        .select('access_code,avatar_url')
         .eq('id', user.id)
         .maybeSingle();
 
@@ -172,6 +172,7 @@ class _PhonePasswordAuthScreenState extends State<PhonePasswordAuthScreen> {
       'phone': phone,
       'display_name': phone,
       'access_code': code,
+      'avatar_url': profile?['avatar_url'],
     });
   }
 
@@ -311,7 +312,7 @@ class _AuthenticatedBootstrapState extends State<AuthenticatedBootstrap> {
     final phone = user.userMetadata?['phone']?.toString() ?? 'Sin telefono';
     final profile = await Supabase.instance.client
         .from('profiles')
-        .select('access_code')
+        .select('access_code,avatar_url')
         .eq('id', user.id)
         .maybeSingle();
     await Supabase.instance.client.from('profiles').upsert({
@@ -319,6 +320,7 @@ class _AuthenticatedBootstrapState extends State<AuthenticatedBootstrap> {
       'phone': phone,
       'display_name': phone,
       'access_code': profile?['access_code'],
+      'avatar_url': profile?['avatar_url'],
     });
   }
 
@@ -394,6 +396,8 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   DateTime _lastRealtimeResubscribeAt = DateTime.fromMillisecondsSinceEpoch(0);
   final _iosBackgroundBridge = IOSBackgroundTaskBridge();
   final _iosSilentAudioBridge = IOSSilentAudioBridge();
+  String? _myBluetoothAvatarBase64;
+  String? _myBluetoothAvatarHash;
 
   String get _currentUserId => _client.auth.currentUser!.id;
 
@@ -433,7 +437,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         ? <dynamic>[]
         : await _client
               .from('profiles')
-              .select('id,phone,display_name')
+              .select('id,phone,display_name,avatar_url')
               .inFilter('id', otherUserIds.toList());
 
     final profileById = <String, Map<String, dynamic>>{};
@@ -490,6 +494,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           id: conversationId,
           peerPhone: phone,
           peerDisplayName: displayName,
+          peerAvatarUrl: profile?['avatar_url']?.toString(),
           lastMessage: lastBody,
           lastMessageAt: lastAt,
           hasUnread: hasUnread,
@@ -522,6 +527,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     _initBluetoothNearby();
     _startBluetoothKeepAlive();
     _loadNearbyChatMeta();
+    _loadMyBluetoothAvatarCache();
     _loadBtNotificationDedupeCache();
     _loadPendingWalkieInvite();
     _requestNotificationPermissions();
@@ -619,6 +625,9 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           peerPresence:
               _nearbyMetaByDeviceId[resolvedId]?.peerPresence ?? 'online',
           peerPresenceAt: _nearbyMetaByDeviceId[resolvedId]?.peerPresenceAt,
+          peerAvatarBase64:
+              _nearbyMetaByDeviceId[resolvedId]?.peerAvatarBase64,
+          peerAvatarHash: _nearbyMetaByDeviceId[resolvedId]?.peerAvatarHash,
         );
         if (!mounted) return;
         setState(() {
@@ -1276,13 +1285,28 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
       if (map['action']?.toString() != 'presence') return false;
       final state = map['state']?.toString() ?? 'online';
+      final incomingAvatarB64 = map['avatarB64']?.toString().trim();
+      final incomingAvatarHash = map['avatarHash']?.toString().trim();
       final current = _nearbyMetaByDeviceId[deviceId];
+      final nextAvatarBase64 = incomingAvatarB64?.isNotEmpty == true
+          ? incomingAvatarB64
+          : current?.peerAvatarBase64;
+      final noVisualChange =
+          current != null &&
+          current.peerPresence == state &&
+          (incomingAvatarHash?.isNotEmpty != true ||
+              incomingAvatarHash == current.peerAvatarHash);
+      if (noVisualChange) return true;
       final updated = NearbyChatMeta(
         lastMessage: current?.lastMessage ?? '',
         lastMessageAt: current?.lastMessageAt,
         hasUnread: current?.hasUnread ?? false,
         peerPresence: state,
         peerPresenceAt: DateTime.now(),
+        peerAvatarBase64: nextAvatarBase64,
+        peerAvatarHash: incomingAvatarHash?.isNotEmpty == true
+            ? incomingAvatarHash
+            : current?.peerAvatarHash,
       );
       if (mounted) {
         setState(() {
@@ -1302,7 +1326,16 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     if (!_isApplePeerSupported) return;
     final state =
         _appLifecycleState == AppLifecycleState.resumed ? 'online' : 'background';
-    final payload = 'btctl::${jsonEncode({'action': 'presence', 'state': state})}';
+    final payloadMap = <String, dynamic>{
+      'action': 'presence',
+      'state': state,
+    };
+    final avatarB64 = _myBluetoothAvatarBase64;
+    if (avatarB64 != null && avatarB64.isNotEmpty) {
+      payloadMap['avatarB64'] = avatarB64;
+      payloadMap['avatarHash'] = _myBluetoothAvatarHash;
+    }
+    final payload = 'btctl::${jsonEncode(payloadMap)}';
     for (final device in _nearbyDevices) {
       final id = device.deviceId.trim();
       if (id.isEmpty) continue;
@@ -1462,6 +1495,9 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
               service: _bluetoothService,
               deviceId: resolvedId,
               peerName: peerLabel,
+              peerAvatarBase64:
+                  _nearbyMetaByDeviceId[resolvedId]?.peerAvatarBase64,
+              peerAvatarHash: _nearbyMetaByDeviceId[resolvedId]?.peerAvatarHash,
               autoOpenVoiceCall: true,
               autoOpenVoiceCallAsInitiator: false,
             ),
@@ -1636,6 +1672,19 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     } catch (_) {}
   }
 
+  Future<void> _loadMyBluetoothAvatarCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final b64 = prefs.getString('my_bt_avatar_b64')?.trim() ?? '';
+      final hash = prefs.getString('my_bt_avatar_hash')?.trim() ?? '';
+      if (!mounted) return;
+      setState(() {
+        _myBluetoothAvatarBase64 = b64.isEmpty ? null : b64;
+        _myBluetoothAvatarHash = hash.isEmpty ? null : hash;
+      });
+    } catch (_) {}
+  }
+
   Future<void> _saveNearbyChatMeta() async {
     final prefs = await SharedPreferences.getInstance();
     final payload = <String, dynamic>{};
@@ -1655,6 +1704,8 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         hasUnread: false,
         peerPresence: current.peerPresence,
         peerPresenceAt: current.peerPresenceAt,
+        peerAvatarBase64: current.peerAvatarBase64,
+        peerAvatarHash: current.peerAvatarHash,
       );
     });
     await _saveNearbyChatMeta();
@@ -2011,6 +2062,20 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
             const SizedBox(width: 10),
             CupertinoButton(
               padding: EdgeInsets.zero,
+              onPressed: () async {
+                await Navigator.of(context).push(
+                  CupertinoPageRoute<void>(
+                    builder: (_) => const ProfileScreen(),
+                  ),
+                );
+                await _loadMyBluetoothAvatarCache();
+                await _broadcastBluetoothPresence();
+              },
+              child: const Icon(CupertinoIcons.person_circle, size: 24),
+            ),
+            const SizedBox(width: 10),
+            CupertinoButton(
+              padding: EdgeInsets.zero,
               onPressed: () => _client.auth.signOut(),
               child: const Icon(CupertinoIcons.square_arrow_right, size: 24),
             ),
@@ -2151,6 +2216,8 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
               service: _bluetoothService,
               deviceId: device.deviceId,
               peerName: peerLabel,
+              peerAvatarBase64: meta?.peerAvatarBase64,
+              peerAvatarHash: meta?.peerAvatarHash,
             ),
           ),
         );
@@ -2160,21 +2227,11 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         child: Row(
           children: [
-            Container(
-              width: 48,
-              height: 48,
-              decoration: const BoxDecoration(
-                color: Color(0xFFD1D1D6),
-                shape: BoxShape.circle,
-              ),
-              alignment: Alignment.center,
-              child: Text(
-                peerLabel.characters.first.toUpperCase(),
-                style: const TextStyle(
-                  color: Color(0xFF1C1C1E),
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
+            _ProfileAvatar(
+              imageBase64: meta?.peerAvatarBase64,
+              imageBase64Hash: meta?.peerAvatarHash,
+              label: peerLabel,
+              size: 48,
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -2309,21 +2366,10 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         child: Row(
           children: [
-            Container(
-              width: 48,
-              height: 48,
-              decoration: const BoxDecoration(
-                color: Color(0xFFD1D1D6),
-                shape: BoxShape.circle,
-              ),
-              alignment: Alignment.center,
-              child: Text(
-                summary.peerDisplayName.characters.first.toUpperCase(),
-                style: const TextStyle(
-                  color: Color(0xFF1C1C1E),
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
+            _ProfileAvatar(
+              imageUrl: summary.peerAvatarUrl,
+              label: summary.peerDisplayName,
+              size: 48,
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -2377,6 +2423,308 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
               ],
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key});
+
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  final _client = Supabase.instance.client;
+  final _picker = ImagePicker();
+  final _codeController = TextEditingController();
+  bool _savingCode = false;
+  bool _uploadingAvatar = false;
+  String? _avatarUrl;
+  String _phone = '';
+  String _displayName = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _loadProfile();
+  }
+
+  @override
+  void dispose() {
+    _codeController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadProfile() async {
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+    final row = await _client
+        .from('profiles')
+        .select('phone,display_name,avatar_url')
+        .eq('id', user.id)
+        .maybeSingle();
+    if (!mounted) return;
+    setState(() {
+      _phone = row?['phone']?.toString() ?? '';
+      _displayName = row?['display_name']?.toString() ?? _phone;
+      _avatarUrl = row?['avatar_url']?.toString();
+    });
+  }
+
+  Future<void> _changeAccessCode() async {
+    final newCode = _codeController.text.trim();
+    if (newCode.length < 4) {
+      await _showInfo('El codigo debe tener al menos 4 caracteres.');
+      return;
+    }
+    final user = _client.auth.currentUser;
+    if (user == null || _savingCode) return;
+
+    setState(() {
+      _savingCode = true;
+    });
+    try {
+      await _client.auth.updateUser(UserAttributes(password: newCode));
+      await _client.from('profiles').update({
+        'access_code': newCode,
+      }).eq('id', user.id);
+      _codeController.clear();
+      if (!mounted) return;
+      await _showInfo('Codigo actualizado.');
+    } on AuthException catch (e) {
+      await _showInfo(e.message);
+    } catch (_) {
+      await _showInfo('No se pudo actualizar el codigo.');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _savingCode = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _changeAvatar() async {
+    if (_uploadingAvatar) return;
+    final user = _client.auth.currentUser;
+    if (user == null) return;
+    try {
+      final photo = await _picker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 85,
+        maxWidth: 512,
+        maxHeight: 512,
+      );
+      if (photo == null) return;
+      setState(() {
+        _uploadingAvatar = true;
+      });
+      final bytes = await photo.readAsBytes();
+      final avatarBase64 = base64Encode(bytes);
+      final avatarHash = avatarBase64.hashCode.toString();
+      final path = 'avatars/${user.id}/profile.jpg';
+      await _client.storage.from('chat-media').uploadBinary(
+        path,
+        bytes,
+        fileOptions: const FileOptions(
+          contentType: 'image/jpeg',
+          upsert: true,
+        ),
+      );
+      final publicUrl = _client.storage.from('chat-media').getPublicUrl(path);
+      final version = DateTime.now().millisecondsSinceEpoch;
+      await _client.from('profiles').update({
+        'avatar_url': '$publicUrl?v=$version',
+      }).eq('id', user.id);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('my_bt_avatar_b64', avatarBase64);
+      await prefs.setString('my_bt_avatar_hash', avatarHash);
+      if (!mounted) return;
+      setState(() {
+        _avatarUrl = '$publicUrl?v=$version';
+      });
+    } on StorageException catch (e) {
+      await _showInfo('Error subiendo foto: ${e.message}');
+    } on PostgrestException catch (e) {
+      await _showInfo('Error guardando perfil: ${e.message}');
+    } catch (e) {
+      await _showInfo('No se pudo actualizar la foto de perfil: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _uploadingAvatar = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _showInfo(String message) async {
+    if (!mounted) return;
+    await showCupertinoDialog<void>(
+      context: context,
+      builder: (context) => CupertinoAlertDialog(
+        content: Text(message),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoPageScaffold(
+      navigationBar: const CupertinoNavigationBar(middle: Text('Perfil')),
+      child: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Center(
+              child: _ProfileAvatar(
+                imageUrl: _avatarUrl,
+                label: _displayName.isEmpty ? _phone : _displayName,
+                size: 92,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Center(
+              child: CupertinoButton(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                onPressed: _uploadingAvatar ? null : _changeAvatar,
+                child: _uploadingAvatar
+                    ? const CupertinoActivityIndicator()
+                    : const Text('Cambiar foto de perfil'),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _displayName.isEmpty ? _phone : _displayName,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _phone,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: CupertinoColors.systemGrey),
+            ),
+            const SizedBox(height: 26),
+            const Text(
+              'Cambiar codigo de acceso',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 10),
+            _IOSField(
+              child: CupertinoTextField(
+                controller: _codeController,
+                keyboardType: TextInputType.number,
+                obscureText: true,
+                placeholder: 'Nuevo codigo (minimo 4)',
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 14,
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            CupertinoButton.filled(
+              onPressed: _savingCode ? null : _changeAccessCode,
+              child: _savingCode
+                  ? const CupertinoActivityIndicator(
+                      color: CupertinoColors.white,
+                    )
+                  : const Text('Guardar codigo'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ProfileAvatar extends StatelessWidget {
+  const _ProfileAvatar({
+    this.imageUrl,
+    this.imageBase64,
+    this.imageBase64Hash,
+    required this.label,
+    required this.size,
+  });
+
+  static final Map<String, Uint8List> _decodedMemoryCache =
+      <String, Uint8List>{};
+
+  final String? imageUrl;
+  final String? imageBase64;
+  final String? imageBase64Hash;
+  final String label;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final firstChar = label.trim().isEmpty
+        ? '?'
+        : label.trim().characters.first.toUpperCase();
+    Uint8List? decodedBytes;
+    final base64Input = imageBase64?.trim() ?? '';
+    if (base64Input.isNotEmpty) {
+      final cacheKey = imageBase64Hash?.trim().isNotEmpty == true
+          ? imageBase64Hash!.trim()
+          : base64Input.hashCode.toString();
+      decodedBytes = _decodedMemoryCache[cacheKey];
+      try {
+        decodedBytes ??= base64Decode(base64Input);
+        _decodedMemoryCache[cacheKey] = decodedBytes;
+        if (_decodedMemoryCache.length > 48) {
+          _decodedMemoryCache.remove(_decodedMemoryCache.keys.first);
+        }
+      } catch (_) {
+        decodedBytes = null;
+      }
+    }
+    final hasUrl = imageUrl?.trim().isNotEmpty == true;
+    return ClipOval(
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: decodedBytes != null
+            ? Image.memory(
+                decodedBytes,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                errorBuilder: (context, error, stackTrace) =>
+                    _fallback(firstChar),
+              )
+            : hasUrl
+            ? Image.network(
+                imageUrl!,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                errorBuilder: (context, error, stackTrace) =>
+                    _fallback(firstChar),
+              )
+            : _fallback(firstChar),
+      ),
+    );
+  }
+
+  Widget _fallback(String firstChar) {
+    return Container(
+      color: const Color(0xFFD1D1D6),
+      alignment: Alignment.center,
+      child: Text(
+        firstChar,
+        style: TextStyle(
+          color: const Color(0xFF1C1C1E),
+          fontWeight: FontWeight.w700,
+          fontSize: size * 0.36,
         ),
       ),
     );
@@ -3537,6 +3885,8 @@ class BluetoothConversationScreen extends StatefulWidget {
     required this.service,
     required this.deviceId,
     required this.peerName,
+    this.peerAvatarBase64,
+    this.peerAvatarHash,
     this.autoOpenVoiceCall = false,
     this.autoOpenVoiceCallAsInitiator = false,
   });
@@ -3544,6 +3894,8 @@ class BluetoothConversationScreen extends StatefulWidget {
   final BluetoothNearbyService service;
   final String deviceId;
   final String peerName;
+  final String? peerAvatarBase64;
+  final String? peerAvatarHash;
   final bool autoOpenVoiceCall;
   final bool autoOpenVoiceCallAsInitiator;
 
@@ -3588,6 +3940,8 @@ class _BluetoothConversationScreenState
   String _onlinePeerDeviceId = '';
   String _backgroundPeerDeviceId = '';
   String _lastIncomingDeviceId = '';
+  String? _peerAvatarBase64;
+  String? _peerAvatarHash;
   bool _peerTyping = false;
   bool _amTyping = false;
   Timer? _typingIdleTimer;
@@ -3745,6 +4099,8 @@ class _BluetoothConversationScreenState
   @override
   void initState() {
     super.initState();
+    _peerAvatarBase64 = widget.peerAvatarBase64;
+    _peerAvatarHash = widget.peerAvatarHash;
     WidgetsBinding.instance.addObserver(this);
     _loadLocalHistory();
     _liveNearbyDevices = widget.service.currentDevices;
@@ -4255,6 +4611,8 @@ class _BluetoothConversationScreenState
       final action = map['action']?.toString() ?? '';
       if (action == 'presence') {
         final state = map['state']?.toString() ?? 'online';
+        final incomingAvatarB64 = map['avatarB64']?.toString().trim();
+        final incomingAvatarHash = map['avatarHash']?.toString().trim();
         final senderId = incomingDeviceId.trim();
         if (state == 'background') {
           final currentOnline = _onlinePeerDeviceId.trim();
@@ -4273,8 +4631,18 @@ class _BluetoothConversationScreenState
           }
         }
         if (!mounted) return true;
+        final shouldUpdateAvatar = incomingAvatarHash?.isNotEmpty == true
+            ? incomingAvatarHash != _peerAvatarHash
+            : incomingAvatarB64?.isNotEmpty == true && _peerAvatarBase64 == null;
+        if (state == _peerPresence && !shouldUpdateAvatar) return true;
         setState(() {
           _peerPresence = state;
+          if (incomingAvatarB64?.isNotEmpty == true && shouldUpdateAvatar) {
+            _peerAvatarBase64 = incomingAvatarB64;
+            _peerAvatarHash = incomingAvatarHash?.isNotEmpty == true
+                ? incomingAvatarHash
+                : incomingAvatarB64.hashCode.toString();
+          }
         });
         return true;
       }
@@ -4760,7 +5128,19 @@ class _BluetoothConversationScreenState
         middle: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(widget.peerName),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _ProfileAvatar(
+                  imageBase64: _peerAvatarBase64,
+                  imageBase64Hash: _peerAvatarHash,
+                  label: widget.peerName,
+                  size: 24,
+                ),
+                const SizedBox(width: 6),
+                Text(widget.peerName),
+              ],
+            ),
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -6346,6 +6726,7 @@ class ConversationSummary {
     required this.id,
     required this.peerPhone,
     required this.peerDisplayName,
+    required this.peerAvatarUrl,
     required this.lastMessage,
     required this.lastMessageAt,
     required this.hasUnread,
@@ -6354,6 +6735,7 @@ class ConversationSummary {
   final String id;
   final String peerPhone;
   final String peerDisplayName;
+  final String? peerAvatarUrl;
   final String lastMessage;
   final DateTime? lastMessageAt;
   final bool hasUnread;
@@ -6366,6 +6748,8 @@ class NearbyChatMeta {
     required this.hasUnread,
     required this.peerPresence,
     required this.peerPresenceAt,
+    required this.peerAvatarBase64,
+    required this.peerAvatarHash,
   });
 
   final String lastMessage;
@@ -6373,6 +6757,8 @@ class NearbyChatMeta {
   final bool hasUnread;
   final String peerPresence;
   final DateTime? peerPresenceAt;
+  final String? peerAvatarBase64;
+  final String? peerAvatarHash;
 
   Map<String, dynamic> toJson() => {
     'lastMessage': lastMessage,
@@ -6380,6 +6766,8 @@ class NearbyChatMeta {
     'hasUnread': hasUnread,
     'peerPresence': peerPresence,
     'peerPresenceAt': peerPresenceAt?.toIso8601String(),
+    'peerAvatarBase64': peerAvatarBase64,
+    'peerAvatarHash': peerAvatarHash,
   };
 
   static NearbyChatMeta? fromJson(dynamic raw) {
@@ -6395,6 +6783,8 @@ class NearbyChatMeta {
       peerPresenceAt: map['peerPresenceAt'] == null
           ? null
           : DateTime.tryParse(map['peerPresenceAt'].toString())?.toLocal(),
+      peerAvatarBase64: map['peerAvatarBase64']?.toString(),
+      peerAvatarHash: map['peerAvatarHash']?.toString(),
     );
   }
 }
