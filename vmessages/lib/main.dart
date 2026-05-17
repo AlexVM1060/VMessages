@@ -579,6 +579,12 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         )) {
           return;
         }
+        if (await _handleIncomingBtWalkieInvite(
+          body: body,
+          incomingDeviceId: resolvedId,
+        )) {
+          return;
+        }
         if (_handleIncomingBtPresence(deviceId: resolvedId, body: body)) {
           return;
         }
@@ -826,6 +832,28 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     required String rawIncoming,
   }) {
     final cleanBody = body.trim();
+    if (cleanBody.startsWith('btvoicecall::')) {
+      final payload = cleanBody.replaceFirst('btvoicecall::', '');
+      try {
+        final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+        final type = map['type']?.toString().trim() ?? '';
+        final callId = map['callId']?.toString().trim() ?? '';
+        if (type == 'invite') {
+          return 'btcall:$deviceId:$type:${callId.isEmpty ? rawIncoming.trim().hashCode : callId}';
+        }
+      } catch (_) {}
+    }
+    if (cleanBody.startsWith('btcall::')) {
+      final payload = cleanBody.replaceFirst('btcall::', '');
+      try {
+        final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+        final type = map['type']?.toString().trim() ?? '';
+        final inviteId = map['inviteId']?.toString().trim() ?? '';
+        if (type == 'start') {
+          return 'btwalkie:$deviceId:$type:${inviteId.isEmpty ? rawIncoming.trim().hashCode : inviteId}';
+        }
+      } catch (_) {}
+    }
     if (cleanBody.startsWith('btmsg::')) {
       final payload = cleanBody.replaceFirst('btmsg::', '');
       try {
@@ -843,6 +871,62 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     }
 
     return 'raw:$deviceId:${rawIncoming.trim()}';
+  }
+
+  Future<void> _showBluetoothEventNotificationIfNeeded({
+    required String deviceId,
+    required String eventType,
+    required String title,
+    required String body,
+    required String rawIncoming,
+  }) async {
+    try {
+      if (_appLifecycleState == AppLifecycleState.resumed) return;
+      if (!_btNotifDedupeLoaded) {
+        await _loadBtNotificationDedupeCache();
+      }
+      final baseKey = _buildBluetoothNotificationKey(
+        deviceId: deviceId,
+        body: rawIncoming,
+        rawIncoming: rawIncoming,
+      );
+      final key = '$eventType:$baseKey';
+      if (_recentBtNotificationKeys.contains(key)) return;
+
+      final peer = _nearbyDevices.firstWhere(
+        (d) => d.deviceId.trim() == deviceId,
+        orElse: () => Device(deviceId, deviceId, 0),
+      );
+      final peerName = peer.deviceName.trim().isNotEmpty
+          ? peer.deviceName.trim()
+          : (peer.deviceId.trim().isEmpty ? 'Bluetooth' : peer.deviceId.trim());
+
+      const details = lnp.NotificationDetails(
+        iOS: lnp.DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+        ),
+        macOS: lnp.DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+        ),
+      );
+      _notificationIdCounter++;
+      await _localNotifications.show(
+        id: _notificationIdCounter,
+        title: '$title · $peerName',
+        body: body,
+        notificationDetails: details,
+      );
+
+      _recentBtNotificationKeys.add(key);
+      if (_recentBtNotificationKeys.length > 250) {
+        _recentBtNotificationKeys.removeAt(0);
+      }
+      await _saveBtNotificationDedupeCache();
+    } catch (_) {}
   }
 
   String _notificationPreviewFromBluetoothBody(String body) {
@@ -1083,11 +1167,19 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       final type = map['type']?.toString() ?? '';
       if (type == 'audio' || type == 'accept') return true;
       if (type != 'invite') return true;
+      final resolvedId = _resolveNearbyDeviceId(incomingDeviceId);
+      await _showBluetoothEventNotificationIfNeeded(
+        deviceId: resolvedId,
+        eventType: 'btcall_invite',
+        title: 'Llamada Bluetooth',
+        body: 'Llamada entrante',
+        rawIncoming: body,
+      );
+      if (_appLifecycleState != AppLifecycleState.resumed) return true;
       if (_incomingBtCallDialogOpen || !mounted) return true;
       _incomingBtCallDialogOpen = true;
       _startIncomingCallTone();
       if (!mounted) return true;
-      final resolvedId = _resolveNearbyDeviceId(incomingDeviceId);
       final peer = _nearbyDevices.firstWhere(
         (d) => d.deviceId.trim() == resolvedId,
         orElse: () => Device(resolvedId, resolvedId, 0),
@@ -1230,6 +1322,30 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       _incomingBtCallDialogOpen = false;
     }
     return true;
+  }
+
+  Future<bool> _handleIncomingBtWalkieInvite({
+    required String body,
+    required String incomingDeviceId,
+  }) async {
+    if (!body.startsWith('btcall::')) return false;
+    try {
+      final payload = body.replaceFirst('btcall::', '');
+      final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+      final type = map['type']?.toString() ?? '';
+      if (type != 'start') return true;
+      final resolvedId = _resolveNearbyDeviceId(incomingDeviceId);
+      await _showBluetoothEventNotificationIfNeeded(
+        deviceId: resolvedId,
+        eventType: 'btwalkie_invite',
+        title: 'Walkie Talkie',
+        body: 'Quiere hablar contigo',
+        rawIncoming: body,
+      );
+      return true;
+    } catch (_) {
+      return true;
+    }
   }
 
   Future<void> _startIncomingCallTone() async {
@@ -3796,10 +3912,14 @@ class _BluetoothConversationScreenState
 
   Future<void> _openWalkieTalkie({required bool isInitiator}) async {
     if (isInitiator) {
-      await widget.service.sendText(
-        _resolveOutgoingDeviceId(),
-        'btcall::${jsonEncode({'type': 'start'})}',
-      );
+      final targetId = _resolveOutgoingDeviceId();
+      final inviteId = DateTime.now().microsecondsSinceEpoch.toString();
+      final payload = 'btcall::${jsonEncode({'type': 'start', 'inviteId': inviteId})}';
+      for (var i = 0; i < 3; i++) {
+        Future<void>.delayed(Duration(milliseconds: i * 220), () {
+          widget.service.sendText(targetId, payload);
+        });
+      }
     }
     if (!mounted) return;
     await Navigator.of(context).push(
@@ -5181,10 +5301,14 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
       } catch (_) {}
     });
     if (widget.sendStartSignalOnOpen) {
-      widget.service.sendText(
-        widget.deviceId,
-        'btcall::${jsonEncode({'type': 'start'})}',
-      );
+      final inviteId = DateTime.now().microsecondsSinceEpoch.toString();
+      final payload =
+          'btcall::${jsonEncode({'type': 'start', 'inviteId': inviteId})}';
+      for (var i = 0; i < 3; i++) {
+        Future<void>.delayed(Duration(milliseconds: i * 220), () {
+          widget.service.sendText(widget.deviceId, payload);
+        });
+      }
     }
   }
 
