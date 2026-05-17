@@ -365,6 +365,8 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   Timer? _homeRefreshFallbackTimer;
   Timer? _iosBluetoothKeepAliveTimer;
   Timer? _iosBackgroundHeartbeatTimer;
+  bool _presenceRefreshInFlight = false;
+  DateTime _lastPresenceRefreshAt = DateTime.fromMillisecondsSinceEpoch(0);
   bool _btBootstrapping = false;
   String? _btError;
   List<Device> _nearbyDevices = const [];
@@ -391,6 +393,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   bool get _isApplePeerSupported => Platform.isIOS || Platform.isMacOS;
   DateTime _lastRealtimeResubscribeAt = DateTime.fromMillisecondsSinceEpoch(0);
   final _iosBackgroundBridge = IOSBackgroundTaskBridge();
+  final _iosSilentAudioBridge = IOSSilentAudioBridge();
 
   String get _currentUserId => _client.auth.currentUser!.id;
 
@@ -577,6 +580,15 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         final body = _extractBtVisibleText(incoming.message);
         if (body.isEmpty) return;
         final resolvedId = _resolveNearbyDeviceId(incoming.deviceId);
+        final incomingMsgId = _extractIncomingBtMsgId(body);
+        if (incomingMsgId != null) {
+          try {
+            await _bluetoothService.sendText(
+              resolvedId,
+              'btack::${jsonEncode({'id': incomingMsgId})}',
+            );
+          } catch (_) {}
+        }
         if (await _handleIncomingBtCallInvite(
           body: body,
           incomingDeviceId: resolvedId,
@@ -586,6 +598,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         if (await _handleIncomingBtWalkieInvite(
           body: body,
           incomingDeviceId: resolvedId,
+          rawIncomingDeviceId: incoming.deviceId,
         )) {
           return;
         }
@@ -631,6 +644,20 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           _btBootstrapping = false;
         });
       }
+    }
+  }
+
+  String? _extractIncomingBtMsgId(String body) {
+    final clean = body.trim();
+    if (!clean.startsWith('btmsg::')) return null;
+    try {
+      final payload = clean.replaceFirst('btmsg::', '');
+      final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+      final id = map['id']?.toString().trim() ?? '';
+      if (id.isEmpty) return null;
+      return id;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -1105,14 +1132,31 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     _iosBluetoothKeepAliveTimer = Timer.periodic(const Duration(seconds: 18), (
       _,
     ) async {
-      try {
-        await _bluetoothService.refreshPresence();
-      } catch (_) {}
+      await _refreshPresenceSafely(minGap: const Duration(seconds: 8));
       if (_appLifecycleState == AppLifecycleState.resumed &&
           _nearbyDevices.isEmpty) {
         await _refreshAdvertising(force: true);
       }
     });
+  }
+
+  Future<void> _refreshPresenceSafely({Duration minGap = Duration.zero}) async {
+    if (!_isApplePeerSupported) return;
+    if (_presenceRefreshInFlight) return;
+    final now = DateTime.now();
+    if (minGap > Duration.zero &&
+        now.difference(_lastPresenceRefreshAt) < minGap) {
+      return;
+    }
+    _presenceRefreshInFlight = true;
+    try {
+      await _bluetoothService.refreshPresence();
+      _lastPresenceRefreshAt = DateTime.now();
+    } catch (_) {
+      _lastPresenceRefreshAt = DateTime.now();
+    } finally {
+      _presenceRefreshInFlight = false;
+    }
   }
 
   Future<void> _refreshAdvertising({bool force = false}) async {
@@ -1144,14 +1188,15 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     try {
       await _iosBackgroundBridge.start();
     } catch (_) {}
+    try {
+      await _iosSilentAudioBridge.start();
+    } catch (_) {}
     _iosBackgroundHeartbeatTimer?.cancel();
     _iosBackgroundHeartbeatTimer = Timer.periodic(const Duration(seconds: 12), (
       _,
     ) async {
       if (_appLifecycleState == AppLifecycleState.resumed) return;
-      try {
-        await _bluetoothService.refreshPresence();
-      } catch (_) {}
+      await _refreshPresenceSafely(minGap: const Duration(seconds: 8));
     });
   }
 
@@ -1161,6 +1206,9 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     if (!Platform.isIOS) return;
     try {
       await _iosBackgroundBridge.stop();
+    } catch (_) {}
+    try {
+      await _iosSilentAudioBridge.stop();
     } catch (_) {}
   }
 
@@ -1176,18 +1224,15 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       await _broadcastBluetoothPresence();
       if (!_isApplePeerSupported) return;
       if (state == AppLifecycleState.resumed) {
-        try {
-          await _bluetoothService.refreshPresence();
-        } catch (_) {}
+        await _refreshPresenceSafely();
         await _refreshAdvertising(force: true);
         return;
       }
       if (state == AppLifecycleState.inactive ||
-          state == AppLifecycleState.paused) {
+          state == AppLifecycleState.paused ||
+          state == AppLifecycleState.hidden) {
         await _startIOSBackgroundExecution();
-        try {
-          await _bluetoothService.refreshPresence();
-        } catch (_) {}
+        await _refreshPresenceSafely();
       }
     },
   );
@@ -1438,6 +1483,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   Future<bool> _handleIncomingBtWalkieInvite({
     required String body,
     required String incomingDeviceId,
+    required String rawIncomingDeviceId,
   }) async {
     if (!body.startsWith('btcall::')) return false;
     try {
@@ -1446,9 +1492,15 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       final type = map['type']?.toString() ?? '';
       if (type != 'start') return true;
       final resolvedId = _resolveNearbyDeviceId(incomingDeviceId);
+      final rawId = rawIncomingDeviceId.trim();
+      final fallbackPhoneLike =
+          RegExp(r'^\+?[0-9]{6,}$').hasMatch(resolvedId.trim());
+      final effectiveId = fallbackPhoneLike && rawId.isNotEmpty
+          ? rawId
+          : resolvedId;
       final inviteId = map['inviteId']?.toString().trim() ?? '';
       await _showBluetoothEventNotificationIfNeeded(
-        deviceId: resolvedId,
+        deviceId: effectiveId,
         eventType: 'btwalkie_invite',
         title: 'Walkie Talkie',
         body: 'Quiere hablar contigo',
@@ -1456,7 +1508,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       );
       if (_appLifecycleState != AppLifecycleState.resumed) {
         _pendingWalkieInvite = <String, String>{
-          'deviceId': resolvedId,
+          'deviceId': effectiveId,
           'inviteId': inviteId,
         };
         await _savePendingWalkieInvite();
@@ -3223,6 +3275,7 @@ class BluetoothNearbyService {
   Stream<List<Device>> get devicesStream => _devicesController.stream;
   Stream<BluetoothIncomingMessage> get messagesStream =>
       _messagesController.stream;
+  List<Device> get currentDevices => List<Device>.from(_devices);
   bool get hasConnectedPeers => _devices.any(
     (d) => d.state.toString().toLowerCase().contains('connected'),
   );
@@ -3459,6 +3512,15 @@ class IOSBackgroundTaskBridge {
   Future<void> stop() => _channel.invokeMethod('stop');
 }
 
+class IOSSilentAudioBridge {
+  static const MethodChannel _channel = MethodChannel(
+    'vmessages/ios_silent_audio',
+  );
+
+  Future<void> start() => _channel.invokeMethod('start');
+  Future<void> stop() => _channel.invokeMethod('stop');
+}
+
 class BluetoothIncomingMessage {
   const BluetoothIncomingMessage({
     required this.deviceId,
@@ -3491,7 +3553,8 @@ class BluetoothConversationScreen extends StatefulWidget {
 }
 
 class _BluetoothConversationScreenState
-    extends State<BluetoothConversationScreen> {
+    extends State<BluetoothConversationScreen>
+    with WidgetsBindingObserver {
   final _controller = TextEditingController();
   final _focusNode = FocusNode();
   final _scrollController = ScrollController();
@@ -3519,8 +3582,12 @@ class _BluetoothConversationScreenState
   bool _showWalkieInvite = false;
   bool _peerInBluetoothCall = false;
   String _incomingWalkieInviteId = '';
+  String _incomingWalkieSenderDeviceId = '';
   bool _showVoiceCallInvite = false;
   String _peerPresence = 'online';
+  String _onlinePeerDeviceId = '';
+  String _backgroundPeerDeviceId = '';
+  String _lastIncomingDeviceId = '';
   bool _peerTyping = false;
   bool _amTyping = false;
   Timer? _typingIdleTimer;
@@ -3529,8 +3596,124 @@ class _BluetoothConversationScreenState
   final List<String> _recentWalkieAudioSignatures = [];
   bool _playingIncomingCallAudio = false;
   bool _loadingHistory = true;
+  Timer? _resumeRelinkTimer;
+  int _resumeRelinkAttempts = 0;
+  AppLifecycleState _screenLifecycleState = AppLifecycleState.resumed;
   String _newBtMessageId() =>
       'bt_${DateTime.now().microsecondsSinceEpoch}_${DateTime.now().millisecondsSinceEpoch % 1000}';
+
+  String? _extractBtMessageId(String raw) {
+    final visibleText = _extractVisibleText(raw);
+    if (!visibleText.startsWith('btmsg::')) return null;
+    try {
+      final payload = visibleText.replaceFirst('btmsg::', '');
+      final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+      final id = map['id']?.toString().trim() ?? '';
+      if (id.isEmpty) return null;
+      return id;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool _handleDeliveryAck(String raw) {
+    final visibleText = _extractVisibleText(raw);
+    if (!visibleText.startsWith('btack::')) return false;
+    try {
+      final payload = visibleText.replaceFirst('btack::', '');
+      final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+      final id = map['id']?.toString().trim() ?? '';
+      if (id.isEmpty) return true;
+      var changed = false;
+      for (var i = 0; i < _messages.length; i++) {
+        final current = _messages[i];
+        if (!current.isMe) continue;
+        if (current.messageId != id) continue;
+        if (current.isDelivered) return true;
+        _messages[i] = current.copyWith(isDelivered: true);
+        changed = true;
+        break;
+      }
+      if (changed && mounted) {
+        setState(() {});
+        _saveLocalHistory();
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  bool _handleSeenAck(String raw) {
+    final visibleText = _extractVisibleText(raw);
+    if (!visibleText.startsWith('btseen::')) return false;
+    try {
+      final payload = visibleText.replaceFirst('btseen::', '');
+      final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+      final id = map['id']?.toString().trim() ?? '';
+      if (id.isEmpty) return true;
+      final targetIndex = _messages.indexWhere(
+        (m) => m.isMe && m.messageId == id,
+      );
+      if (targetIndex == -1) return true;
+      final targetSentAt = _messages[targetIndex].sentAt;
+      var changed = false;
+      for (var i = 0; i < _messages.length; i++) {
+        final current = _messages[i];
+        if (!current.isMe) continue;
+        if (current.sentAt.isAfter(targetSentAt)) continue;
+        if (current.isSeen) continue;
+        _messages[i] = current.copyWith(isDelivered: true, isSeen: true);
+        changed = true;
+      }
+      if (changed && mounted) {
+        setState(() {});
+        _saveLocalHistory();
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  Future<void> _sendDeliveryAck(String messageId) async {
+    final id = messageId.trim();
+    if (id.isEmpty) return;
+    await _sendTextSmart('btack::${jsonEncode({'id': id})}');
+  }
+
+  Future<void> _sendSeenAck(String messageId) async {
+    final id = messageId.trim();
+    if (id.isEmpty) return;
+    await _sendTextSmart('btseen::${jsonEncode({'id': id})}');
+  }
+
+  Future<void> _sendLatestSeenIfAny() async {
+    if (!_canMarkSeenNow()) return;
+    if (!mounted) return;
+    final latestIncomingWithId = _messages.lastWhere(
+      (m) => !m.isMe && m.messageId.trim().isNotEmpty,
+      orElse: () => _BluetoothChatMessage(
+        messageId: '',
+        text: '',
+        isMe: false,
+        isDelivered: true,
+        isSeen: true,
+        sentAt: DateTime.fromMillisecondsSinceEpoch(0),
+        photoBytes: null,
+        audioBytes: null,
+        audioDurationMs: null,
+        caption: null,
+      ),
+    );
+    final id = latestIncomingWithId.messageId.trim();
+    if (id.isEmpty) return;
+    await _sendSeenAck(id);
+  }
+
+  bool _canMarkSeenNow() {
+    if (!mounted) return false;
+    if (_screenLifecycleState != AppLifecycleState.resumed) return false;
+    final route = ModalRoute.of(context);
+    if (route?.isCurrent != true) return false;
+    return true;
+  }
 
   bool _isDuplicateLastIncoming(_BluetoothChatMessage incoming) {
     if (_messages.isEmpty) return false;
@@ -3562,22 +3745,43 @@ class _BluetoothConversationScreenState
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadLocalHistory();
+    _liveNearbyDevices = widget.service.currentDevices;
     _devicesSub = widget.service.devicesStream.listen((devices) {
       _liveNearbyDevices = devices;
     });
     _incomingSub = widget.service.messagesStream.listen((event) {
       if (!mounted) return;
-      if (_handleCallSignal(event.message)) return;
-      if (_handleControlSignal(event.message)) return;
+      if (_handleDeliveryAck(event.message)) return;
+      if (_handleSeenAck(event.message)) return;
+      if (_handleCallSignal(event.message, event.deviceId)) return;
+      if (_handleControlSignal(event.message, event.deviceId)) return;
+      final incomingMessageId = _extractBtMessageId(event.message);
+      if (incomingMessageId != null) {
+        unawaited(_sendDeliveryAck(incomingMessageId));
+      }
       final incoming = _parseIncomingMessage(event.message);
       if (incoming == null) return;
+      final senderId = event.deviceId.trim();
+      if (senderId.isNotEmpty) {
+        _lastIncomingDeviceId = senderId;
+        if (_peerPresence == 'background') {
+          _backgroundPeerDeviceId = senderId;
+        } else {
+          _onlinePeerDeviceId = senderId;
+        }
+      }
       if (_isDuplicateLastIncoming(incoming)) return;
       setState(() {
         _messages.add(incoming.copyWith(isMe: false, sentAt: DateTime.now()));
       });
       _saveLocalHistory();
       _animateToBottom();
+      final seenId = incoming.messageId.trim();
+      if (seenId.isNotEmpty && _canMarkSeenNow()) {
+        unawaited(_sendSeenAck(seenId));
+      }
     });
     _connectIfNeeded();
     _audioPlayer.onPlayerComplete.listen((_) {
@@ -3597,6 +3801,43 @@ class _BluetoothConversationScreenState
         _openVoiceCall(isInitiator: widget.autoOpenVoiceCallAsInitiator);
       });
     }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _screenLifecycleState = state;
+    if (state != AppLifecycleState.resumed) return;
+    _startResumeRelink();
+    unawaited(_sendLatestSeenIfAny());
+  }
+
+  void _startResumeRelink() {
+    _resumeRelinkTimer?.cancel();
+    _resumeRelinkAttempts = 0;
+    _resumeRelinkTimer = Timer.periodic(const Duration(milliseconds: 900), (
+      timer,
+    ) async {
+      if (!mounted) {
+        timer.cancel();
+        _resumeRelinkTimer = null;
+        return;
+      }
+      if (_resumeRelinkAttempts >= 8) {
+        timer.cancel();
+        _resumeRelinkTimer = null;
+        return;
+      }
+      _resumeRelinkAttempts++;
+      try {
+        await widget.service.refreshPresence();
+      } catch (_) {}
+      final targets = _candidateOutgoingPeerIds();
+      for (final target in targets) {
+        try {
+          await widget.service.invite(target, deviceName: widget.peerName);
+        } catch (_) {}
+      }
+    });
   }
 
   Future<void> _connectIfNeeded() async {
@@ -3630,6 +3871,14 @@ class _BluetoothConversationScreenState
   }
 
   String _resolveOutgoingDeviceId() {
+    final onlinePinned = _onlinePeerDeviceId.trim();
+    final backgroundPinned = _backgroundPeerDeviceId.trim();
+    if (_peerPresence == 'background' && backgroundPinned.isNotEmpty) {
+      return backgroundPinned;
+    }
+    if (_peerPresence != 'background' && onlinePinned.isNotEmpty) {
+      return onlinePinned;
+    }
     final fallback = widget.deviceId.trim();
     if (_liveNearbyDevices.isEmpty) return fallback;
     final target = _normalizePeerName(widget.peerName);
@@ -3649,7 +3898,48 @@ class _BluetoothConversationScreenState
       if (aIsFallback != bIsFallback) return aIsFallback ? 1 : -1;
       return 0;
     });
-    return matches.first.deviceId.trim();
+    final resolved = matches.first.deviceId.trim();
+    if (resolved.isNotEmpty) {
+      if (_peerPresence == 'background') {
+        _backgroundPeerDeviceId = resolved;
+      } else {
+        _onlinePeerDeviceId = resolved;
+      }
+    }
+    return resolved;
+  }
+
+  List<String> _candidateOutgoingPeerIds() {
+    final out = <String>{};
+    final resolved = _resolveOutgoingDeviceId().trim();
+    if (resolved.isNotEmpty) out.add(resolved);
+    final onlinePinned = _onlinePeerDeviceId.trim();
+    if (onlinePinned.isNotEmpty) out.add(onlinePinned);
+    final backgroundPinned = _backgroundPeerDeviceId.trim();
+    if (backgroundPinned.isNotEmpty) out.add(backgroundPinned);
+    final lastIncoming = _lastIncomingDeviceId.trim();
+    if (lastIncoming.isNotEmpty) out.add(lastIncoming);
+    final fallback = widget.deviceId.trim();
+    if (fallback.isNotEmpty) out.add(fallback);
+    if (_peerPresence == 'background') {
+      for (final d in _liveNearbyDevices) {
+        final id = d.deviceId.trim();
+        if (id.isNotEmpty) out.add(id);
+      }
+    }
+    return out.toList();
+  }
+
+  Future<void> _sendTextSmart(String payload) async {
+    final targets = _candidateOutgoingPeerIds();
+    for (final target in targets) {
+      try {
+        await widget.service.invite(target, deviceName: widget.peerName);
+      } catch (_) {}
+      try {
+        await widget.service.sendText(target, payload);
+      } catch (_) {}
+    }
   }
 
   Future<void> _send() async {
@@ -3668,18 +3958,19 @@ class _BluetoothConversationScreenState
         await _sendVoiceNote();
       } else {
         final id = _newBtMessageId();
-        await widget.service.sendText(
-          _resolveOutgoingDeviceId(),
+        await _sendTextSmart(
           'btmsg::${jsonEncode({'id': id, 'type': 'text', 'text': text})}',
         );
         if (!mounted) return;
         setState(() {
-          _messages.add(
-            _BluetoothChatMessage(
-              messageId: id,
-              text: text,
-              isMe: true,
-              sentAt: DateTime.now(),
+            _messages.add(
+              _BluetoothChatMessage(
+                messageId: id,
+                text: text,
+                isMe: true,
+                isDelivered: false,
+                isSeen: false,
+                sentAt: DateTime.now(),
               photoBytes: null,
               audioBytes: null,
               audioDurationMs: null,
@@ -3718,7 +4009,7 @@ class _BluetoothConversationScreenState
       'bytes': base64Encode(bytes),
       'caption': caption,
     });
-    await widget.service.sendText(_resolveOutgoingDeviceId(), 'btmsg::$payload');
+    await _sendTextSmart('btmsg::$payload');
     if (!mounted) return;
     setState(() {
       _messages.add(
@@ -3726,6 +4017,8 @@ class _BluetoothConversationScreenState
           messageId: id,
           text: '',
           isMe: true,
+          isDelivered: false,
+          isSeen: false,
           sentAt: DateTime.now(),
           photoBytes: bytes,
           audioBytes: null,
@@ -3747,7 +4040,7 @@ class _BluetoothConversationScreenState
       'bytes': base64Encode(voice),
       'durationMs': _pendingVoiceDurationMs ?? 0,
     });
-    await widget.service.sendText(_resolveOutgoingDeviceId(), 'btmsg::$payload');
+    await _sendTextSmart('btmsg::$payload');
     if (!mounted) return;
     setState(() {
       _messages.add(
@@ -3755,6 +4048,8 @@ class _BluetoothConversationScreenState
           messageId: id,
           text: '',
           isMe: true,
+          isDelivered: false,
+          isSeen: false,
           sentAt: DateTime.now(),
           photoBytes: null,
           audioBytes: voice,
@@ -3882,7 +4177,7 @@ class _BluetoothConversationScreenState
     });
   }
 
-  bool _handleCallSignal(String raw) {
+  bool _handleCallSignal(String raw, String incomingDeviceId) {
     final visibleText = _extractVisibleText(raw);
     if (visibleText.startsWith('btvoicecall::')) {
       try {
@@ -3907,17 +4202,22 @@ class _BluetoothConversationScreenState
         final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
         final type = map['type']?.toString() ?? '';
         if (type == 'start') {
+          final senderId = incomingDeviceId.trim();
           final inviteId = map['inviteId']?.toString().trim() ?? '';
           setState(() {
             _showWalkieInvite = true;
             _peerInBluetoothCall = true;
             _incomingWalkieInviteId = inviteId;
+            if (senderId.isNotEmpty) {
+              _incomingWalkieSenderDeviceId = senderId;
+            }
           });
         } else if (type == 'end') {
           setState(() {
             _showWalkieInvite = false;
             _peerInBluetoothCall = false;
             _incomingWalkieInviteId = '';
+            _incomingWalkieSenderDeviceId = '';
           });
         }
       } catch (_) {}
@@ -3946,7 +4246,7 @@ class _BluetoothConversationScreenState
     return false;
   }
 
-  bool _handleControlSignal(String raw) {
+  bool _handleControlSignal(String raw, String incomingDeviceId) {
     final visibleText = _extractVisibleText(raw);
     if (!visibleText.startsWith('btctl::')) return false;
     try {
@@ -3955,6 +4255,23 @@ class _BluetoothConversationScreenState
       final action = map['action']?.toString() ?? '';
       if (action == 'presence') {
         final state = map['state']?.toString() ?? 'online';
+        final senderId = incomingDeviceId.trim();
+        if (state == 'background') {
+          final currentOnline = _onlinePeerDeviceId.trim();
+          if (currentOnline.isEmpty) {
+            final currentResolved = _resolveOutgoingDeviceId().trim();
+            if (currentResolved.isNotEmpty) {
+              _onlinePeerDeviceId = currentResolved;
+            }
+          }
+          if (senderId.isNotEmpty) {
+            _backgroundPeerDeviceId = senderId;
+          }
+        } else {
+          if (senderId.isNotEmpty) {
+            _onlinePeerDeviceId = senderId;
+          }
+        }
         if (!mounted) return true;
         setState(() {
           _peerPresence = state;
@@ -3983,8 +4300,7 @@ class _BluetoothConversationScreenState
       _messages.removeWhere((m) => m.messageId == message.messageId);
     });
     await _saveLocalHistory();
-    await widget.service.sendText(
-      _resolveOutgoingDeviceId(),
+    await _sendTextSmart(
       'btctl::${jsonEncode({'action': 'delete', 'messageId': message.messageId})}',
     );
   }
@@ -4026,8 +4342,7 @@ class _BluetoothConversationScreenState
     if (_amTyping == isTyping) return;
     _amTyping = isTyping;
     unawaited(
-      widget.service.sendText(
-        _resolveOutgoingDeviceId(),
+      _sendTextSmart(
         'btctl::${jsonEncode({'action': 'typing', 'isTyping': isTyping})}',
       ),
     );
@@ -4035,17 +4350,21 @@ class _BluetoothConversationScreenState
 
   Future<void> _openWalkieTalkie({required bool isInitiator}) async {
     String? sessionInviteId;
+    String targetId = widget.deviceId;
     if (isInitiator) {
-      final targetId = _resolveOutgoingDeviceId();
+      targetId = _resolveOutgoingDeviceId();
       final inviteId = DateTime.now().microsecondsSinceEpoch.toString();
       sessionInviteId = inviteId;
       final payload = 'btcall::${jsonEncode({'type': 'start', 'inviteId': inviteId})}';
       for (var i = 0; i < 3; i++) {
         Future<void>.delayed(Duration(milliseconds: i * 220), () {
-          widget.service.sendText(targetId, payload);
+          _sendTextSmart(payload);
         });
       }
     } else {
+      targetId = _incomingWalkieSenderDeviceId.trim().isNotEmpty
+          ? _incomingWalkieSenderDeviceId.trim()
+          : _resolveOutgoingDeviceId();
       sessionInviteId = _incomingWalkieInviteId.trim().isEmpty
           ? null
           : _incomingWalkieInviteId.trim();
@@ -4055,9 +4374,9 @@ class _BluetoothConversationScreenState
       CupertinoPageRoute<void>(
         builder: (_) => WalkieTalkieScreen(
           service: widget.service,
-          deviceId: widget.deviceId,
+          deviceId: targetId,
           peerName: widget.peerName,
-          sendStartSignalOnOpen: false,
+          sendStartSignalOnOpen: isInitiator,
           inviteId: sessionInviteId,
           isJoiner: !isInitiator,
         ),
@@ -4068,13 +4387,13 @@ class _BluetoothConversationScreenState
       _showWalkieInvite = false;
       _peerInBluetoothCall = false;
       _incomingWalkieInviteId = '';
+      _incomingWalkieSenderDeviceId = '';
     });
   }
 
   Future<void> _openVoiceCall({required bool isInitiator}) async {
     if (isInitiator) {
-      await widget.service.sendText(
-        _resolveOutgoingDeviceId(),
+      await _sendTextSmart(
         'btvoicecall::${jsonEncode({'type': 'invite'})}',
       );
     }
@@ -4118,12 +4437,13 @@ class _BluetoothConversationScreenState
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _typingIdleTimer?.cancel();
     _peerTypingExpiryTimer?.cancel();
+    _resumeRelinkTimer?.cancel();
     if (_amTyping) {
       unawaited(
-        widget.service.sendText(
-          _resolveOutgoingDeviceId(),
+        _sendTextSmart(
           'btctl::${jsonEncode({'action': 'typing', 'isTyping': false})}',
         ),
       );
@@ -4279,6 +4599,8 @@ class _BluetoothConversationScreenState
     if (visibleText.startsWith('btcall::') ||
         visibleText.startsWith('btcallvoice::') ||
         visibleText.startsWith('btvoicecall::') ||
+        visibleText.startsWith('btack::') ||
+        visibleText.startsWith('btseen::') ||
         visibleText.startsWith('btctl::')) {
       return null;
     }
@@ -4296,6 +4618,8 @@ class _BluetoothConversationScreenState
             messageId: id,
             text: '',
             isMe: false,
+            isDelivered: true,
+            isSeen: true,
             sentAt: DateTime.now(),
             photoBytes: bytes,
             audioBytes: null,
@@ -4314,6 +4638,8 @@ class _BluetoothConversationScreenState
             messageId: id,
             text: '',
             isMe: false,
+            isDelivered: true,
+            isSeen: true,
             sentAt: DateTime.now(),
             photoBytes: null,
             audioBytes: bytes,
@@ -4327,6 +4653,8 @@ class _BluetoothConversationScreenState
           messageId: id,
           text: text.trim(),
           isMe: false,
+          isDelivered: true,
+          isSeen: true,
           sentAt: DateTime.now(),
           photoBytes: null,
           audioBytes: null,
@@ -4348,6 +4676,8 @@ class _BluetoothConversationScreenState
           messageId: _newBtMessageId(),
           text: '',
           isMe: false,
+          isDelivered: true,
+          isSeen: true,
           sentAt: DateTime.now(),
           photoBytes: bytes,
           audioBytes: null,
@@ -4372,6 +4702,8 @@ class _BluetoothConversationScreenState
           messageId: _newBtMessageId(),
           text: '',
           isMe: false,
+          isDelivered: true,
+          isSeen: true,
           sentAt: DateTime.now(),
           photoBytes: null,
           audioBytes: bytes,
@@ -4386,6 +4718,8 @@ class _BluetoothConversationScreenState
       messageId: _newBtMessageId(),
       text: visibleText,
       isMe: false,
+      isDelivered: true,
+      isSeen: true,
       sentAt: DateTime.now(),
       photoBytes: null,
       audioBytes: null,
@@ -4606,136 +4940,177 @@ class _BluetoothConversationScreenState
                                 );
                               }
                               final message = _messages[index];
+                              final isLastOutgoing = message.isMe &&
+                                  !_messages
+                                      .skip(index + 1)
+                                      .any((m) => m.isMe);
                               return Row(
                                 mainAxisAlignment: message.isMe
                                     ? MainAxisAlignment.end
                                     : MainAxisAlignment.start,
                                 children: [
-                                  CupertinoContextMenu(
-                                    actions: [
-                                      CupertinoContextMenuAction(
-                                        isDestructiveAction: true,
-                                        trailingIcon: CupertinoIcons.delete,
-                                        onPressed: message.isMe
-                                            ? () async {
-                                                Navigator.of(context).pop();
-                                                await _deleteMessageForEveryone(
-                                                  message,
-                                                );
-                                              }
-                                            : null,
-                                        child: Text(
-                                          message.isMe
-                                              ? 'Eliminar para todos'
-                                              : 'Solo remitente',
-                                        ),
-                                      ),
-                                    ],
-                                    child: Container(
-                                      margin: const EdgeInsets.only(bottom: 8),
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 14,
-                                        vertical: 10,
-                                      ),
-                                      constraints: BoxConstraints(
-                                        maxWidth:
-                                            MediaQuery.of(context).size.width *
-                                            0.76,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        color: message.isMe
-                                            ? const Color(0xFF0A84FF)
-                                            : const Color(0xFFE5E5EA),
-                                        borderRadius: BorderRadius.circular(20),
-                                      ),
-                                      child:
-                                          message.photoBytes == null &&
-                                              message.audioBytes == null
-                                          ? Text(
-                                              message.text,
-                                              style: TextStyle(
-                                                fontSize: 16,
-                                                color: message.isMe
-                                                    ? CupertinoColors.white
-                                                    : const Color(0xFF1C1C1E),
-                                              ),
-                                            )
-                                          : message.audioBytes != null
-                                          ? CupertinoButton(
-                                              padding: EdgeInsets.zero,
-                                              minimumSize: Size.zero,
-                                              onPressed: () =>
-                                                  _playVoiceMessage(message),
-                                              child: Row(
-                                                mainAxisSize: MainAxisSize.min,
-                                                children: [
-                                                  Icon(
-                                                    _playingMessageId ==
-                                                            '${message.sentAt.millisecondsSinceEpoch}_${message.isMe}'
-                                                        ? CupertinoIcons
-                                                              .stop_fill
-                                                        : CupertinoIcons
-                                                              .play_fill,
+                                  Column(
+                                    crossAxisAlignment: message.isMe
+                                        ? CrossAxisAlignment.end
+                                        : CrossAxisAlignment.start,
+                                    children: [
+                                      CupertinoContextMenu(
+                                        actions: [
+                                          CupertinoContextMenuAction(
+                                            isDestructiveAction: true,
+                                            trailingIcon: CupertinoIcons.delete,
+                                            onPressed: message.isMe
+                                                ? () async {
+                                                    Navigator.of(context).pop();
+                                                    await _deleteMessageForEveryone(
+                                                      message,
+                                                    );
+                                                  }
+                                                : null,
+                                            child: Text(
+                                              message.isMe
+                                                  ? 'Eliminar para todos'
+                                                  : 'Solo remitente',
+                                            ),
+                                          ),
+                                        ],
+                                        child: Container(
+                                          margin: const EdgeInsets.only(bottom: 4),
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 14,
+                                            vertical: 10,
+                                          ),
+                                          constraints: BoxConstraints(
+                                            maxWidth:
+                                                MediaQuery.of(context).size.width *
+                                                0.76,
+                                          ),
+                                          decoration: BoxDecoration(
+                                            color: message.isMe
+                                                ? const Color(0xFF0A84FF)
+                                                : const Color(0xFFE5E5EA),
+                                            borderRadius: BorderRadius.circular(20),
+                                          ),
+                                          child:
+                                              message.photoBytes == null &&
+                                                  message.audioBytes == null
+                                              ? Text(
+                                                  message.text,
+                                                  style: TextStyle(
+                                                    fontSize: 16,
                                                     color: message.isMe
                                                         ? CupertinoColors.white
-                                                        : const Color(
-                                                            0xFF1C1C1E,
-                                                          ),
-                                                    size: 22,
+                                                        : const Color(0xFF1C1C1E),
                                                   ),
-                                                  const SizedBox(width: 8),
-                                                  Text(
-                                                    _formatVoiceDuration(
-                                                      message.audioDurationMs,
+                                                )
+                                              : message.audioBytes != null
+                                              ? CupertinoButton(
+                                                  padding: EdgeInsets.zero,
+                                                  minimumSize: Size.zero,
+                                                  onPressed: () =>
+                                                      _playVoiceMessage(message),
+                                                  child: Row(
+                                                    mainAxisSize: MainAxisSize.min,
+                                                    children: [
+                                                      Icon(
+                                                        _playingMessageId ==
+                                                                '${message.sentAt.millisecondsSinceEpoch}_${message.isMe}'
+                                                            ? CupertinoIcons
+                                                                  .stop_fill
+                                                            : CupertinoIcons
+                                                                  .play_fill,
+                                                        color: message.isMe
+                                                            ? CupertinoColors.white
+                                                            : const Color(
+                                                                0xFF1C1C1E,
+                                                              ),
+                                                        size: 22,
+                                                      ),
+                                                      const SizedBox(width: 8),
+                                                      Text(
+                                                        _formatVoiceDuration(
+                                                          message.audioDurationMs,
+                                                        ),
+                                                        style: TextStyle(
+                                                          fontSize: 14,
+                                                          color: message.isMe
+                                                              ? CupertinoColors
+                                                                    .white
+                                                              : const Color(
+                                                                  0xFF1C1C1E,
+                                                                ),
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ),
+                                                )
+                                              : Column(
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.start,
+                                                  mainAxisSize: MainAxisSize.min,
+                                                  children: [
+                                                    ClipRRect(
+                                                      borderRadius:
+                                                          BorderRadius.circular(14),
+                                                      child: Image.memory(
+                                                        message.photoBytes!,
+                                                        width: 220,
+                                                        height: 220,
+                                                        fit: BoxFit.cover,
+                                                      ),
                                                     ),
-                                                    style: TextStyle(
-                                                      fontSize: 14,
-                                                      color: message.isMe
-                                                          ? CupertinoColors
-                                                                .white
-                                                          : const Color(
-                                                              0xFF1C1C1E,
-                                                            ),
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                            )
-                                          : Column(
-                                              crossAxisAlignment:
-                                                  CrossAxisAlignment.start,
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                ClipRRect(
-                                                  borderRadius:
-                                                      BorderRadius.circular(14),
-                                                  child: Image.memory(
-                                                    message.photoBytes!,
-                                                    width: 220,
-                                                    height: 220,
-                                                    fit: BoxFit.cover,
-                                                  ),
+                                                    if ((message.caption ?? '')
+                                                        .trim()
+                                                        .isNotEmpty) ...[
+                                                      const SizedBox(height: 6),
+                                                      Text(
+                                                        message.caption!.trim(),
+                                                        style: TextStyle(
+                                                          fontSize: 14,
+                                                          color: message.isMe
+                                                              ? CupertinoColors
+                                                                    .white
+                                                              : const Color(
+                                                                  0xFF1C1C1E,
+                                                                ),
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ],
                                                 ),
-                                                if ((message.caption ?? '')
-                                                    .trim()
-                                                    .isNotEmpty) ...[
-                                                  const SizedBox(height: 6),
-                                                  Text(
-                                                    message.caption!.trim(),
-                                                    style: TextStyle(
-                                                      fontSize: 14,
-                                                      color: message.isMe
-                                                          ? CupertinoColors
-                                                                .white
-                                                          : const Color(
-                                                              0xFF1C1C1E,
-                                                            ),
-                                                    ),
-                                                  ),
-                                                ],
-                                              ],
+                                        ),
+                                      ),
+                                      if (message.isMe && !message.isDelivered)
+                                        Padding(
+                                          padding: const EdgeInsets.only(
+                                            right: 6,
+                                            bottom: 6,
+                                          ),
+                                          child: const Text(
+                                            'Enviando...',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              color: Color(0xFF8E8E93),
                                             ),
-                                    ),
+                                          ),
+                                        ),
+                                      if (message.isMe &&
+                                          message.isDelivered &&
+                                          isLastOutgoing)
+                                        Padding(
+                                          padding: const EdgeInsets.only(
+                                            right: 6,
+                                            bottom: 6,
+                                          ),
+                                          child: Text(
+                                            message.isSeen ? 'Visto' : 'Entregado',
+                                            style: const TextStyle(
+                                              fontSize: 11,
+                                              color: Color(0xFF8E8E93),
+                                            ),
+                                          ),
+                                        ),
+                                    ],
                                   ),
                                 ],
                               );
@@ -5400,9 +5775,12 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
 }
 
 class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
+  static const bool _debugWalkieOverlay = true;
   final _audioRecorder = AudioRecorder();
   final _audioPlayer = AudioPlayer();
   StreamSubscription<BluetoothIncomingMessage>? _incomingSub;
+  StreamSubscription<List<Device>>? _devicesSub;
+  List<Device> _liveNearbyDevices = const [];
   final List<Uint8List> _incomingQueue = [];
   final List<String> _recentIncomingSignatures = [];
   bool _playingIncoming = false;
@@ -5413,20 +5791,48 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
   StreamSubscription<Amplitude>? _amplitudeSub;
   List<double> _spectrum = List<double>.filled(20, 0.08);
   String _activeInviteId = '';
+  String _lockedPeerDeviceId = '';
   bool _peerReadyForPtt = false;
+  String _debugLastEvent = '-';
+  String _debugLastEventDeviceId = '-';
+  Timer? _joinerAcceptRetryTimer;
+  Timer? _initiatorStartRetryTimer;
+  Timer? _peerDiscoveryRefreshTimer;
+  int _joinerAcceptRetries = 0;
+  int _initiatorStartRetries = 0;
 
   @override
   void initState() {
     super.initState();
     _activeInviteId = widget.inviteId?.trim() ?? '';
     _peerReadyForPtt = widget.isJoiner;
+    _liveNearbyDevices = widget.service.currentDevices;
+    _devicesSub = widget.service.devicesStream.listen((devices) {
+      _liveNearbyDevices = devices;
+    });
+    _peerDiscoveryRefreshTimer = Timer.periodic(
+      const Duration(milliseconds: 900),
+      (_) async {
+        if (!mounted) return;
+        if (_peerReadyForPtt) return;
+        try {
+          await widget.service.refreshPresence();
+        } catch (_) {}
+      },
+    );
     _incomingSub = widget.service.messagesStream.listen((event) {
+      final eventDeviceId = event.deviceId.trim();
+      if (eventDeviceId.isNotEmpty) {
+        _lockedPeerDeviceId = eventDeviceId;
+        _debugLastEventDeviceId = eventDeviceId;
+      }
       final raw = _extractBtEnvelopeVisibleText(event.message);
       if (raw.startsWith('btcall::')) {
         try {
           final payload = raw.replaceFirst('btcall::', '');
           final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
           final type = map['type']?.toString() ?? '';
+          _debugLastEvent = 'btcall:$type';
           final incomingInviteId = map['inviteId']?.toString().trim() ?? '';
           if (type == 'start' && _activeInviteId.isEmpty && incomingInviteId.isNotEmpty) {
             _activeInviteId = incomingInviteId;
@@ -5441,6 +5847,10 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
             setState(() {
               _peerReadyForPtt = true;
             });
+            _joinerAcceptRetryTimer?.cancel();
+            _joinerAcceptRetryTimer = null;
+            _initiatorStartRetryTimer?.cancel();
+            _initiatorStartRetryTimer = null;
           }
         } catch (_) {}
         return;
@@ -5449,6 +5859,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
       try {
         final payload = raw.replaceFirst('btcallvoice::', '');
         final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+        _debugLastEvent = 'btcallvoice';
         final incomingInviteId = map['inviteId']?.toString().trim() ?? '';
         if (_activeInviteId.isNotEmpty &&
             incomingInviteId.isNotEmpty &&
@@ -5459,6 +5870,10 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
           setState(() {
             _peerReadyForPtt = true;
           });
+          _joinerAcceptRetryTimer?.cancel();
+          _joinerAcceptRetryTimer = null;
+          _initiatorStartRetryTimer?.cancel();
+          _initiatorStartRetryTimer = null;
         }
         final bytesRaw = map['bytes']?.toString() ?? '';
         final durationRaw = map['durationMs']?.toString() ?? '0';
@@ -5479,23 +5894,127 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
           ? DateTime.now().microsecondsSinceEpoch.toString()
           : _activeInviteId;
       _activeInviteId = inviteId;
-      final payload =
-          'btcall::${jsonEncode({'type': 'start', 'inviteId': inviteId})}';
-      for (var i = 0; i < 3; i++) {
-        Future<void>.delayed(Duration(milliseconds: i * 220), () {
-          widget.service.sendText(widget.deviceId, payload);
-        });
-      }
+      _sendStartBurst();
+      _startInitiatorRetryHandshake();
     }
     if (widget.isJoiner && _activeInviteId.isNotEmpty) {
-      final acceptPayload =
-          'btcall::${jsonEncode({'type': 'accept', 'inviteId': _activeInviteId})}';
-      for (var i = 0; i < 3; i++) {
-        Future<void>.delayed(Duration(milliseconds: i * 220), () {
-          widget.service.sendText(widget.deviceId, acceptPayload);
-        });
+      _sendAcceptBurst();
+      _startJoinerRetryHandshake();
+    }
+  }
+
+  void _sendStartBurst() {
+    if (_activeInviteId.isEmpty) return;
+    final payload =
+        'btcall::${jsonEncode({'type': 'start', 'inviteId': _activeInviteId})}';
+    for (var i = 0; i < 3; i++) {
+      Future<void>.delayed(Duration(milliseconds: i * 220), () {
+        _sendTextToPeerCandidates(payload);
+      });
+    }
+  }
+
+  void _sendAcceptBurst() {
+    if (_activeInviteId.isEmpty) return;
+    final payload =
+        'btcall::${jsonEncode({'type': 'accept', 'inviteId': _activeInviteId})}';
+    for (var i = 0; i < 3; i++) {
+      Future<void>.delayed(Duration(milliseconds: i * 220), () {
+        _sendTextToPeerCandidates(payload);
+      });
+    }
+  }
+
+  void _sendTextToPeerCandidates(String payload) {
+    final targets = _candidateTargetDeviceIds();
+    for (final target in targets) {
+      widget.service.sendText(target, payload);
+    }
+  }
+
+  List<String> _candidateTargetDeviceIds() {
+    final fallback = widget.deviceId.trim();
+    final out = <String>{};
+    final fallbackLooksPhone = RegExp(r'^\+?[0-9]{6,}$').hasMatch(fallback);
+    if (_lockedPeerDeviceId.trim().isNotEmpty) {
+      out.add(_lockedPeerDeviceId.trim());
+    }
+    if (fallback.isNotEmpty && !fallbackLooksPhone) out.add(fallback);
+    final target = _normalizePeerName(widget.peerName);
+    for (final d in _liveNearbyDevices) {
+      final id = d.deviceId.trim();
+      if (id.isEmpty) continue;
+      if (target.isNotEmpty && _normalizePeerName(d.deviceName) == target) {
+        out.add(id);
+      }
+      if (_normalizePeerName(id) == target) {
+        out.add(id);
       }
     }
+    if (out.isEmpty && fallback.isNotEmpty) {
+      out.add(fallback);
+    }
+    return out.toList();
+  }
+
+  String _debugPeerSummary() {
+    final live = _liveNearbyDevices
+        .map((d) => '${d.deviceName.trim().isEmpty ? d.deviceId.trim() : d.deviceName.trim()}(${d.deviceId.trim()})')
+        .join(' | ');
+    final candidates = _candidateTargetDeviceIds().join(', ');
+    return 'inviteId=$_activeInviteId\n'
+        'ready=$_peerReadyForPtt joiner=${widget.isJoiner}\n'
+        'locked=$_lockedPeerDeviceId\n'
+        'fallback=${widget.deviceId.trim()}\n'
+        'candidates=$candidates\n'
+        'lastEvent=$_debugLastEvent from=$_debugLastEventDeviceId\n'
+        'livePeers=${live.isEmpty ? "-" : live}';
+  }
+
+  void _startJoinerRetryHandshake() {
+    _joinerAcceptRetryTimer?.cancel();
+    _joinerAcceptRetries = 0;
+    _joinerAcceptRetryTimer = Timer.periodic(const Duration(milliseconds: 900), (
+      timer,
+    ) {
+      if (!mounted || _peerReadyForPtt) {
+        timer.cancel();
+        _joinerAcceptRetryTimer = null;
+        return;
+      }
+      if (_joinerAcceptRetries >= 14) {
+        timer.cancel();
+        _joinerAcceptRetryTimer = null;
+        return;
+      }
+      _joinerAcceptRetries++;
+      _sendAcceptBurst();
+    });
+  }
+
+  void _startInitiatorRetryHandshake() {
+    _initiatorStartRetryTimer?.cancel();
+    _initiatorStartRetries = 0;
+    _initiatorStartRetryTimer = Timer.periodic(const Duration(milliseconds: 900), (
+      timer,
+    ) {
+      if (!mounted || _peerReadyForPtt) {
+        timer.cancel();
+        _initiatorStartRetryTimer = null;
+        return;
+      }
+      if (_initiatorStartRetries >= 14) {
+        timer.cancel();
+        _initiatorStartRetryTimer = null;
+        return;
+      }
+      _initiatorStartRetries++;
+      _sendStartBurst();
+    });
+  }
+
+  String _normalizePeerName(String value) {
+    return value.trim().toLowerCase().replaceAll(RegExp(r'[^a-z0-9+]'), '');
   }
 
   Future<void> _startPtt() async {
@@ -5567,7 +6086,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
       'durationMs': durationMs,
       'inviteId': _activeInviteId,
     });
-    await widget.service.sendText(widget.deviceId, 'btcallvoice::$payload');
+    _sendTextToPeerCandidates('btcallvoice::$payload');
   }
 
   Future<void> _playQueue() async {
@@ -5597,11 +6116,14 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
 
   @override
   void dispose() {
-    widget.service.sendText(
-      widget.deviceId,
+    _sendTextToPeerCandidates(
       'btcall::${jsonEncode({'type': 'end', 'inviteId': _activeInviteId})}',
     );
     _incomingSub?.cancel();
+    _devicesSub?.cancel();
+    _joinerAcceptRetryTimer?.cancel();
+    _initiatorStartRetryTimer?.cancel();
+    _peerDiscoveryRefreshTimer?.cancel();
     _ticker?.cancel();
     _amplitudeSub?.cancel();
     _audioRecorder.dispose();
@@ -5683,6 +6205,25 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
             else
               const CupertinoActivityIndicator(radius: 16),
             const SizedBox(height: 36),
+            if (_debugWalkieOverlay)
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0x11FF9500),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0x44FF9500)),
+                ),
+                child: Text(
+                  _debugPeerSummary(),
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xFF1C1C1E),
+                    fontFeatures: [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
           ],
         ),
       ),
@@ -5695,6 +6236,8 @@ class _BluetoothChatMessage {
     required this.messageId,
     required this.text,
     required this.isMe,
+    required this.isDelivered,
+    required this.isSeen,
     required this.sentAt,
     required this.photoBytes,
     required this.audioBytes,
@@ -5705,6 +6248,8 @@ class _BluetoothChatMessage {
   final String messageId;
   final String text;
   final bool isMe;
+  final bool isDelivered;
+  final bool isSeen;
   final DateTime sentAt;
   final Uint8List? photoBytes;
   final Uint8List? audioBytes;
@@ -5715,6 +6260,8 @@ class _BluetoothChatMessage {
     String? messageId,
     String? text,
     bool? isMe,
+    bool? isDelivered,
+    bool? isSeen,
     DateTime? sentAt,
     Uint8List? photoBytes,
     Uint8List? audioBytes,
@@ -5725,6 +6272,8 @@ class _BluetoothChatMessage {
       messageId: messageId ?? this.messageId,
       text: text ?? this.text,
       isMe: isMe ?? this.isMe,
+      isDelivered: isDelivered ?? this.isDelivered,
+      isSeen: isSeen ?? this.isSeen,
       sentAt: sentAt ?? this.sentAt,
       photoBytes: photoBytes ?? this.photoBytes,
       audioBytes: audioBytes ?? this.audioBytes,
@@ -5738,6 +6287,8 @@ class _BluetoothChatMessage {
       'messageId': messageId,
       'text': text,
       'isMe': isMe,
+      'isDelivered': isDelivered,
+      'isSeen': isSeen,
       'sentAt': sentAt.toIso8601String(),
       'photoBytes': photoBytes == null ? null : base64Encode(photoBytes!),
       'audioBytes': audioBytes == null ? null : base64Encode(audioBytes!),
@@ -5777,6 +6328,8 @@ class _BluetoothChatMessage {
           : 'legacy_${sentAt.millisecondsSinceEpoch}',
       text: map['text']?.toString() ?? '',
       isMe: map['isMe'] == true,
+      isDelivered: map['isDelivered'] == true || map['isMe'] != true,
+      isSeen: map['isSeen'] == true || map['isMe'] != true,
       sentAt: sentAt,
       photoBytes: decodedPhoto,
       audioBytes: decodedAudio,
