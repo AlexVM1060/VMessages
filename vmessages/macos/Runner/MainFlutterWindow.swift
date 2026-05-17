@@ -32,6 +32,7 @@ final class MacNearbyBridge: NSObject {
 
   private var serviceType = "vmsgchat"
   private var localPeerID = MCPeerID(displayName: Host.current().localizedName ?? "Mac")
+  private var localDisplayName = Host.current().localizedName ?? "Mac"
   private var session: MCSession?
   private var advertiser: MCNearbyServiceAdvertiser?
   private var browser: MCNearbyServiceBrowser?
@@ -47,6 +48,9 @@ final class MacNearbyBridge: NSObject {
     methodChannel.setMethodCallHandler(handleMethodCall)
     peersEventChannel.setStreamHandler(PeersStreamHandler(owner: self))
     messagesEventChannel.setStreamHandler(MessagesStreamHandler(owner: self))
+  }
+
+  deinit {
   }
 
   private func handleMethodCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -101,7 +105,8 @@ final class MacNearbyBridge: NSObject {
 
   private func initialize(serviceTypeArg: String, deviceName: String) {
     serviceType = String(serviceTypeArg.prefix(15))
-    localPeerID = MCPeerID(displayName: deviceName)
+    localDisplayName = sanitizePeerName(deviceName)
+    localPeerID = MCPeerID(displayName: localDisplayName)
     let newSession = MCSession(peer: localPeerID, securityIdentity: nil, encryptionPreference: .required)
     newSession.delegate = self
     session = newSession
@@ -111,6 +116,9 @@ final class MacNearbyBridge: NSObject {
   }
 
   private func startAdvertising() {
+    if session == nil {
+      initialize(serviceTypeArg: serviceType, deviceName: localDisplayName)
+    }
     advertiser?.stopAdvertisingPeer()
     let newAdvertiser = MCNearbyServiceAdvertiser(peer: localPeerID, discoveryInfo: nil, serviceType: serviceType)
     newAdvertiser.delegate = self
@@ -124,6 +132,9 @@ final class MacNearbyBridge: NSObject {
   }
 
   private func startBrowsing() {
+    if session == nil {
+      initialize(serviceTypeArg: serviceType, deviceName: localDisplayName)
+    }
     browser?.stopBrowsingForPeers()
     let newBrowser = MCNearbyServiceBrowser(peer: localPeerID, serviceType: serviceType)
     newBrowser.delegate = self
@@ -134,6 +145,13 @@ final class MacNearbyBridge: NSObject {
   private func stopBrowsing() {
     browser?.stopBrowsingForPeers()
     browser = nil
+  }
+
+  private func sanitizePeerName(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let base = trimmed.isEmpty ? "Mac" : trimmed
+    let compact = base.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    return String(compact.prefix(63))
   }
 
   private func invitePeer(deviceID: String) {

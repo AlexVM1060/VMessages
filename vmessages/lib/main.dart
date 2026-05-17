@@ -367,6 +367,9 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   bool _btBootstrapping = false;
   String? _btError;
   List<Device> _nearbyDevices = const [];
+  final Map<String, Device> _recentNearbyDevicesById = <String, Device>{};
+  final Map<String, DateTime> _recentNearbySeenAtById = <String, DateTime>{};
+  static const Duration _nearbyDeviceRetention = Duration(seconds: 95);
   final Map<String, NearbyChatMeta> _nearbyMetaByDeviceId = {};
   StreamSubscription<BluetoothIncomingMessage>? _btIncomingSub;
   RealtimeChannel? _messageNotificationsChannel;
@@ -382,6 +385,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   static const String _btNotifDedupePrefsKey = 'bt_notif_dedupe_keys_v1';
   bool _btNotifDedupeLoaded = false;
   bool get _isApplePeerSupported => Platform.isIOS || Platform.isMacOS;
+  DateTime _lastRealtimeResubscribeAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   String get _currentUserId => _client.auth.currentUser!.id;
 
@@ -508,11 +512,11 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       setState(() {});
     });
     _initBluetoothNearby();
-    _startIosBluetoothKeepAlive();
+    _startBluetoothKeepAlive();
     _loadNearbyChatMeta();
     _loadBtNotificationDedupeCache();
     _requestNotificationPermissions();
-    _subscribeMessageNotifications();
+    _resubscribeMessageNotifications(force: true);
   }
 
   @override
@@ -545,9 +549,18 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       await _bluetoothService.start(displayName: phone);
       _bluetoothService.devicesStream.listen((devices) {
         if (!mounted) return;
+        final now = DateTime.now();
+        for (final device in devices) {
+          final id = device.deviceId.trim();
+          if (id.isEmpty) continue;
+          _recentNearbyDevicesById[id] = device;
+          _recentNearbySeenAtById[id] = now;
+        }
+        _pruneStaleNearbyDevices();
         setState(() {
           _nearbyDevices = devices;
         });
+        unawaited(_broadcastBluetoothPresence());
       });
       _btIncomingSub?.cancel();
       _btIncomingSub = _bluetoothService.messagesStream.listen((
@@ -555,14 +568,17 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       ) async {
         final body = _extractBtVisibleText(incoming.message);
         if (body.isEmpty) return;
+        final resolvedId = _resolveNearbyDeviceId(incoming.deviceId);
         if (await _handleIncomingBtCallInvite(
           body: body,
-          incomingDeviceId: incoming.deviceId,
+          incomingDeviceId: resolvedId,
         )) {
           return;
         }
+        if (_handleIncomingBtPresence(deviceId: resolvedId, body: body)) {
+          return;
+        }
         if (_isBluetoothControlPayload(body)) return;
-        final resolvedId = _resolveNearbyDeviceId(incoming.deviceId);
         await _appendNearbyIncomingToHistory(deviceId: resolvedId, body: body);
         await _showBluetoothMessageNotificationIfNeeded(
           deviceId: resolvedId,
@@ -573,6 +589,9 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           lastMessage: body.startsWith('btphoto::') ? '📷 Foto' : body,
           lastMessageAt: DateTime.now(),
           hasUnread: true,
+          peerPresence:
+              _nearbyMetaByDeviceId[resolvedId]?.peerPresence ?? 'online',
+          peerPresenceAt: _nearbyMetaByDeviceId[resolvedId]?.peerPresenceAt,
         );
         if (!mounted) return;
         setState(() {
@@ -580,6 +599,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         });
         await _saveNearbyChatMeta();
       });
+      await _broadcastBluetoothPresence();
     } on MissingPluginException {
       if (!mounted) return;
       setState(() {
@@ -630,6 +650,19 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           },
         )
         .subscribe();
+  }
+
+  void _resubscribeMessageNotifications({bool force = false}) {
+    final secondsSinceLast = DateTime.now()
+        .difference(_lastRealtimeResubscribeAt)
+        .inSeconds;
+    if (!force && secondsSinceLast < 2) return;
+    _lastRealtimeResubscribeAt = DateTime.now();
+    if (_messageNotificationsChannel != null) {
+      _client.removeChannel(_messageNotificationsChannel!);
+      _messageNotificationsChannel = null;
+    }
+    _subscribeMessageNotifications();
   }
 
   Future<void> _handleIncomingMessageNotification(
@@ -868,13 +901,18 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     }
   }
 
-  void _startIosBluetoothKeepAlive() {
-    if (!Platform.isIOS) return;
+  void _startBluetoothKeepAlive() {
+    if (!_isApplePeerSupported) return;
     _iosBluetoothKeepAliveTimer?.cancel();
-    _iosBluetoothKeepAliveTimer = Timer.periodic(const Duration(seconds: 45), (
+    _iosBluetoothKeepAliveTimer = Timer.periodic(const Duration(seconds: 18), (
       _,
     ) async {
-      await _refreshAdvertising();
+      try {
+        await _bluetoothService.refreshPresence();
+      } catch (_) {}
+      if (_nearbyDevices.isEmpty) {
+        await _refreshAdvertising(force: true);
+      }
     });
   }
 
@@ -885,7 +923,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         .inSeconds;
     final shouldSkip =
         !force &&
-        (_bluetoothService.hasConnectedPeers || inactivitySeconds < 40);
+        (_bluetoothService.hasConnectedPeers || inactivitySeconds < 22);
     if (shouldSkip) return;
     try {
       final phone =
@@ -900,9 +938,16 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     onChanged: (state) async {
       _appLifecycleState = state;
       if (!mounted) return;
+      if (state == AppLifecycleState.resumed) {
+        _resubscribeMessageNotifications();
+      }
+      await _broadcastBluetoothPresence();
       if (!_isApplePeerSupported) return;
       if (state == AppLifecycleState.resumed ||
           state == AppLifecycleState.inactive) {
+        try {
+          await _bluetoothService.refreshPresence();
+        } catch (_) {}
         await _refreshAdvertising(force: true);
       }
     },
@@ -935,6 +980,52 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         body.startsWith('btcallvoice::') ||
         body.startsWith('btvoicecall::') ||
         body.startsWith('btctl::');
+  }
+
+  bool _handleIncomingBtPresence({
+    required String deviceId,
+    required String body,
+  }) {
+    if (!body.startsWith('btctl::')) return false;
+    try {
+      final payload = body.replaceFirst('btctl::', '');
+      final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+      if (map['action']?.toString() != 'presence') return false;
+      final state = map['state']?.toString() ?? 'online';
+      final current = _nearbyMetaByDeviceId[deviceId];
+      final updated = NearbyChatMeta(
+        lastMessage: current?.lastMessage ?? '',
+        lastMessageAt: current?.lastMessageAt,
+        hasUnread: current?.hasUnread ?? false,
+        peerPresence: state,
+        peerPresenceAt: DateTime.now(),
+      );
+      if (mounted) {
+        setState(() {
+          _nearbyMetaByDeviceId[deviceId] = updated;
+        });
+      } else {
+        _nearbyMetaByDeviceId[deviceId] = updated;
+      }
+      unawaited(_saveNearbyChatMeta());
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _broadcastBluetoothPresence() async {
+    if (!_isApplePeerSupported) return;
+    final state =
+        _appLifecycleState == AppLifecycleState.resumed ? 'online' : 'background';
+    final payload = 'btctl::${jsonEncode({'action': 'presence', 'state': state})}';
+    for (final device in _nearbyDevices) {
+      final id = device.deviceId.trim();
+      if (id.isEmpty) continue;
+      try {
+        await _bluetoothService.sendText(id, payload);
+      } catch (_) {}
+    }
   }
 
   Future<bool> _handleIncomingBtCallInvite({
@@ -1126,9 +1217,10 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   }
 
   Future<String> _ensureIncomingCallToneFile() async {
-    final dir = await getTemporaryDirectory();
+    final dir = await _runtimeTempDir();
     final path = '${dir.path}/incoming_call_ringtone.wav';
     final file = File(path);
+    await file.parent.create(recursive: true);
     if (!await file.exists()) {
       await file.writeAsBytes(_incomingCallToneBytes!, flush: true);
     }
@@ -1230,9 +1322,43 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         lastMessage: current.lastMessage,
         lastMessageAt: current.lastMessageAt,
         hasUnread: false,
+        peerPresence: current.peerPresence,
+        peerPresenceAt: current.peerPresenceAt,
       );
     });
     await _saveNearbyChatMeta();
+  }
+
+  void _pruneStaleNearbyDevices() {
+    final now = DateTime.now();
+    final staleIds = <String>[];
+    _recentNearbySeenAtById.forEach((id, seenAt) {
+      if (now.difference(seenAt) > _nearbyDeviceRetention) {
+        staleIds.add(id);
+      }
+    });
+    for (final id in staleIds) {
+      _recentNearbySeenAtById.remove(id);
+      _recentNearbyDevicesById.remove(id);
+    }
+  }
+
+  List<Device> _visibleNearbyDevices() {
+    _pruneStaleNearbyDevices();
+    final merged = Map<String, Device>.from(_recentNearbyDevicesById);
+    for (final device in _nearbyDevices) {
+      final id = device.deviceId.trim();
+      if (id.isEmpty) continue;
+      merged[id] = device;
+    }
+    return merged.values.toList()
+      ..sort((a, b) {
+        final aSeen =
+            _recentNearbySeenAtById[a.deviceId.trim()] ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final bSeen =
+            _recentNearbySeenAtById[b.deviceId.trim()] ?? DateTime.fromMillisecondsSinceEpoch(0);
+        return bSeen.compareTo(aSeen);
+      });
   }
 
   String _btHistoryKey(String deviceId) =>
@@ -1578,7 +1704,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                 .map((row) => row['conversation_id'].toString())
                 .toList();
 
-            if (conversationIds.isEmpty && _nearbyDevices.isEmpty) {
+            if (conversationIds.isEmpty && _visibleNearbyDevices().isEmpty) {
               return _buildHomePlaceholder();
             }
 
@@ -1651,7 +1777,9 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         ),
       ];
     }
-    return _nearbyDevices.map(_buildNearbyConversationTile).toList();
+    final visibleDevices = _visibleNearbyDevices();
+    if (visibleDevices.isEmpty) return const [];
+    return visibleDevices.map(_buildNearbyConversationTile).toList();
   }
 
   Widget _buildNearbyConversationTile(Device device) {
@@ -1662,9 +1790,25 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     final subtitle = meta?.lastMessage.trim().isNotEmpty == true
         ? meta!.lastMessage
         : 'Dispositivo cercano';
+    final presence = _effectiveNearbyPresence(meta);
+    final presenceColor = presence == 'background'
+        ? const Color(0xFFFF9500)
+        : CupertinoColors.activeGreen;
+    final presenceLabel = presence == 'background' ? 'En segundo plano' : 'En linea';
     final time = meta?.lastMessageAt == null
         ? ''
         : _formatTime(meta!.lastMessageAt!);
+    final isConnected = device.state
+        .toString()
+        .toLowerCase()
+        .contains('connected');
+    final statusLabel = isConnected ? 'Conectado' : 'Cercano';
+    final statusColor = isConnected
+        ? CupertinoColors.activeGreen
+        : CupertinoColors.systemBlue;
+    final statusBg = isConnected
+        ? const Color(0x1A34C759)
+        : const Color(0x1A0A84FF);
     return CupertinoButton(
       padding: EdgeInsets.zero,
       onPressed: () async {
@@ -1714,6 +1858,28 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
+                  const SizedBox(height: 2),
+                  Row(
+                    children: [
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          color: presenceColor,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        presenceLabel,
+                        style: TextStyle(
+                          color: presenceColor,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: 4),
                   Text(
                     subtitle,
@@ -1755,22 +1921,22 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                     vertical: 4,
                   ),
                   decoration: BoxDecoration(
-                    color: const Color(0x1A0A84FF),
+                    color: statusBg,
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: const Row(
+                  child: Row(
                     children: [
                       Icon(
                         CupertinoIcons.dot_radiowaves_left_right,
                         size: 12,
-                        color: CupertinoColors.systemBlue,
+                        color: statusColor,
                       ),
-                      SizedBox(width: 4),
+                      const SizedBox(width: 4),
                       Text(
-                        'Cercano',
+                        statusLabel,
                         style: TextStyle(
                           fontSize: 12,
-                          color: CupertinoColors.systemBlue,
+                          color: statusColor,
                           fontWeight: FontWeight.w600,
                         ),
                       ),
@@ -1783,6 +1949,16 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         ),
       ),
     );
+  }
+
+  String _effectiveNearbyPresence(NearbyChatMeta? meta) {
+    final state = meta?.peerPresence ?? 'online';
+    final at = meta?.peerPresenceAt;
+    if (at == null) return state;
+    if (DateTime.now().difference(at).inSeconds > 18) {
+      return 'background';
+    }
+    return state;
   }
 
   Widget _buildConversationTile(ConversationSummary summary) {
@@ -1890,7 +2066,8 @@ class ConversationScreen extends StatefulWidget {
   State<ConversationScreen> createState() => _ConversationScreenState();
 }
 
-class _ConversationScreenState extends State<ConversationScreen> {
+class _ConversationScreenState extends State<ConversationScreen>
+    with WidgetsBindingObserver {
   final _client = Supabase.instance.client;
   final _scrollController = ScrollController();
   RealtimeChannel? _messagesChannel;
@@ -1902,12 +2079,14 @@ class _ConversationScreenState extends State<ConversationScreen> {
   bool _loading = true;
   String? _error;
   bool _wasKeyboardVisible = false;
+  DateTime _lastRealtimeResubscribeAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _fetchMessages();
-    _subscribeToRealtime();
+    _resubscribeConversationRealtime(force: true);
     _fallbackTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _fetchMessages(silent: true);
     });
@@ -1915,12 +2094,21 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _fallbackTimer?.cancel();
     _scrollController.dispose();
     if (_messagesChannel != null) {
       _client.removeChannel(_messagesChannel!);
     }
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _resubscribeConversationRealtime();
+      _fetchMessages(silent: true);
+    }
   }
 
   void _jumpToBottom() {
@@ -2058,6 +2246,19 @@ class _ConversationScreenState extends State<ConversationScreen> {
           },
         )
         .subscribe();
+  }
+
+  void _resubscribeConversationRealtime({bool force = false}) {
+    final secondsSinceLast = DateTime.now()
+        .difference(_lastRealtimeResubscribeAt)
+        .inSeconds;
+    if (!force && secondsSinceLast < 2) return;
+    _lastRealtimeResubscribeAt = DateTime.now();
+    if (_messagesChannel != null) {
+      _client.removeChannel(_messagesChannel!);
+      _messagesChannel = null;
+    }
+    _subscribeToRealtime();
   }
 
   @override
@@ -2746,6 +2947,7 @@ class BluetoothNearbyService {
   bool get hasConnectedPeers => _devices.any(
     (d) => d.state.toString().toLowerCase().contains('connected'),
   );
+  bool get requiresExplicitInvite => true;
   DateTime get lastActivityAt => _lastActivityAt;
 
   Future<void> start({required String displayName}) async {
@@ -2769,7 +2971,6 @@ class BluetoothNearbyService {
       _started = true;
       return;
     }
-
     await _nearby.init(
       serviceType: _serviceType,
       strategy: Strategy.P2P_CLUSTER,
@@ -2834,10 +3035,38 @@ class BluetoothNearbyService {
   Future<void> sendText(String deviceId, String text) async {
     _lastActivityAt = DateTime.now();
     if (Platform.isMacOS) {
-      await _macBridge.sendMessage(deviceID: deviceId, message: text);
+      Object? lastError;
+      for (var attempt = 0; attempt < 4; attempt++) {
+        try {
+          if (attempt > 0) {
+            await _macBridge.invitePeer(deviceID: deviceId);
+            await Future<void>.delayed(const Duration(milliseconds: 260));
+          }
+          await _macBridge.sendMessage(deviceID: deviceId, message: text);
+          return;
+        } catch (e) {
+          lastError = e;
+        }
+      }
+      debugPrint('No se pudo enviar mensaje BT en macOS: $lastError');
       return;
     }
-    await _nearby.sendMessage(deviceId, text);
+    try {
+      await _nearby.sendMessage(deviceId, text);
+    } catch (e) {
+      Object? lastError = e;
+      for (var attempt = 0; attempt < 3; attempt++) {
+        try {
+          await _nearby.invitePeer(deviceID: deviceId, deviceName: null);
+          await Future<void>.delayed(const Duration(milliseconds: 260));
+          await _nearby.sendMessage(deviceId, text);
+          return;
+        } catch (retryError) {
+          lastError = retryError;
+        }
+      }
+      debugPrint('No se pudo enviar mensaje BT: $lastError');
+    }
   }
 
   Future<void> stop() async {
@@ -2983,6 +3212,8 @@ class _BluetoothConversationScreenState
   final _audioPlayer = AudioPlayer();
   final List<_BluetoothChatMessage> _messages = [];
   StreamSubscription<BluetoothIncomingMessage>? _incomingSub;
+  StreamSubscription<List<Device>>? _devicesSub;
+  List<Device> _liveNearbyDevices = const [];
   bool _connecting = false;
   bool _sending = false;
   bool _wasKeyboardVisible = false;
@@ -3000,6 +3231,11 @@ class _BluetoothConversationScreenState
   bool _showWalkieInvite = false;
   bool _peerInBluetoothCall = false;
   bool _showVoiceCallInvite = false;
+  String _peerPresence = 'online';
+  bool _peerTyping = false;
+  bool _amTyping = false;
+  Timer? _typingIdleTimer;
+  Timer? _peerTypingExpiryTimer;
   final List<Uint8List> _incomingCallQueue = [];
   final List<String> _recentWalkieAudioSignatures = [];
   bool _playingIncomingCallAudio = false;
@@ -3038,10 +3274,13 @@ class _BluetoothConversationScreenState
   void initState() {
     super.initState();
     _loadLocalHistory();
+    _devicesSub = widget.service.devicesStream.listen((devices) {
+      _liveNearbyDevices = devices;
+    });
     _incomingSub = widget.service.messagesStream.listen((event) {
       if (!mounted) return;
       if (_handleCallSignal(event.message)) return;
-      if (_handleDeleteControl(event.message)) return;
+      if (_handleControlSignal(event.message)) return;
       final incoming = _parseIncomingMessage(event.message);
       if (incoming == null) return;
       if (_isDuplicateLastIncoming(incoming)) return;
@@ -3072,11 +3311,22 @@ class _BluetoothConversationScreenState
   }
 
   Future<void> _connectIfNeeded() async {
+    if (!widget.service.requiresExplicitInvite) {
+      if (mounted) {
+        setState(() {
+          _connecting = false;
+        });
+      }
+      return;
+    }
     setState(() {
       _connecting = true;
     });
     try {
-      await widget.service.invite(widget.deviceId, deviceName: widget.peerName);
+      await widget.service.invite(
+        _resolveOutgoingDeviceId(),
+        deviceName: widget.peerName,
+      );
     } finally {
       if (mounted) {
         setState(() {
@@ -3084,6 +3334,33 @@ class _BluetoothConversationScreenState
         });
       }
     }
+  }
+
+  String _normalizePeerName(String value) {
+    return value.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  String _resolveOutgoingDeviceId() {
+    final fallback = widget.deviceId.trim();
+    if (_liveNearbyDevices.isEmpty) return fallback;
+    final target = _normalizePeerName(widget.peerName);
+    final matches = _liveNearbyDevices.where((d) {
+      final id = d.deviceId.trim();
+      if (id.isEmpty) return false;
+      final name = _normalizePeerName(d.deviceName);
+      return name == target || id == fallback;
+    }).toList();
+    if (matches.isEmpty) return fallback;
+    matches.sort((a, b) {
+      final aConnected = a.state.toString().toLowerCase().contains('connected');
+      final bConnected = b.state.toString().toLowerCase().contains('connected');
+      if (aConnected != bConnected) return bConnected ? 1 : -1;
+      final aIsFallback = a.deviceId.trim() == fallback;
+      final bIsFallback = b.deviceId.trim() == fallback;
+      if (aIsFallback != bIsFallback) return aIsFallback ? 1 : -1;
+      return 0;
+    });
+    return matches.first.deviceId.trim();
   }
 
   Future<void> _send() async {
@@ -3103,7 +3380,7 @@ class _BluetoothConversationScreenState
       } else {
         final id = _newBtMessageId();
         await widget.service.sendText(
-          widget.deviceId,
+          _resolveOutgoingDeviceId(),
           'btmsg::${jsonEncode({'id': id, 'type': 'text', 'text': text})}',
         );
         if (!mounted) return;
@@ -3130,6 +3407,7 @@ class _BluetoothConversationScreenState
       });
       _saveLocalHistory();
       _controller.clear();
+      _onComposerChanged('');
       _animateToBottom();
     } finally {
       if (mounted) {
@@ -3151,7 +3429,7 @@ class _BluetoothConversationScreenState
       'bytes': base64Encode(bytes),
       'caption': caption,
     });
-    await widget.service.sendText(widget.deviceId, 'btmsg::$payload');
+    await widget.service.sendText(_resolveOutgoingDeviceId(), 'btmsg::$payload');
     if (!mounted) return;
     setState(() {
       _messages.add(
@@ -3180,7 +3458,7 @@ class _BluetoothConversationScreenState
       'bytes': base64Encode(voice),
       'durationMs': _pendingVoiceDurationMs ?? 0,
     });
-    await widget.service.sendText(widget.deviceId, 'btmsg::$payload');
+    await widget.service.sendText(_resolveOutgoingDeviceId(), 'btmsg::$payload');
     if (!mounted) return;
     setState(() {
       _messages.add(
@@ -3206,8 +3484,27 @@ class _BluetoothConversationScreenState
       return;
     }
     final hasPermission = await _audioRecorder.hasPermission();
-    if (!hasPermission) return;
-    final dir = await getTemporaryDirectory();
+    if (!hasPermission) {
+      if (!mounted) return;
+      await showCupertinoDialog<void>(
+        context: context,
+        builder: (_) => CupertinoAlertDialog(
+          title: const Text('Permiso de microfono'),
+          content: const Text(
+            'Activa el microfono para enviar audios desde este dispositivo.',
+          ),
+          actions: [
+            CupertinoDialogAction(
+              isDefaultAction: true,
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    final dir = await _runtimeTempDir();
     final path =
         '${dir.path}/bt_voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
     await _audioRecorder.start(
@@ -3262,7 +3559,7 @@ class _BluetoothConversationScreenState
       _recordingStartedAt = null;
       _pendingVoiceBytes = bytes;
       _pendingVoiceDurationMs = durationMs > 0 ? durationMs : null;
-      _recordingElapsedMs = 0;
+      _recordingElapsedMs = 0; 
       _recordingSpectrum = List<double>.filled(20, 0.08);
     });
     _recordingTicker?.cancel();
@@ -3283,9 +3580,10 @@ class _BluetoothConversationScreenState
       });
       return;
     }
-    final dir = await getTemporaryDirectory();
+    final dir = await _runtimeTempDir();
     final path = '${dir.path}/play_voice_$messageId.m4a';
     final file = File(path);
+    await file.parent.create(recursive: true);
     await file.writeAsBytes(message.audioBytes!, flush: true);
     await _audioPlayer.stop();
     await _audioPlayer.play(DeviceFileSource(path));
@@ -3356,13 +3654,27 @@ class _BluetoothConversationScreenState
     return false;
   }
 
-  bool _handleDeleteControl(String raw) {
+  bool _handleControlSignal(String raw) {
     final visibleText = _extractVisibleText(raw);
     if (!visibleText.startsWith('btctl::')) return false;
     try {
       final payload = visibleText.replaceFirst('btctl::', '');
       final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
-      if (map['action']?.toString() != 'delete') return true;
+      final action = map['action']?.toString() ?? '';
+      if (action == 'presence') {
+        final state = map['state']?.toString() ?? 'online';
+        if (!mounted) return true;
+        setState(() {
+          _peerPresence = state;
+        });
+        return true;
+      }
+      if (action == 'typing') {
+        final isTyping = map['isTyping'] == true;
+        _setPeerTyping(isTyping);
+        return true;
+      }
+      if (action != 'delete') return true;
       final messageId = map['messageId']?.toString() ?? '';
       if (messageId.isEmpty) return true;
       setState(() {
@@ -3380,15 +3692,59 @@ class _BluetoothConversationScreenState
     });
     await _saveLocalHistory();
     await widget.service.sendText(
-      widget.deviceId,
+      _resolveOutgoingDeviceId(),
       'btctl::${jsonEncode({'action': 'delete', 'messageId': message.messageId})}',
+    );
+  }
+
+  void _setPeerTyping(bool value) {
+    _peerTypingExpiryTimer?.cancel();
+    if (!mounted) return;
+    setState(() {
+      _peerTyping = value;
+    });
+    if (value) {
+      _animateToBottom();
+    }
+    if (value) {
+      _peerTypingExpiryTimer = Timer(const Duration(seconds: 5), () {
+        if (!mounted) return;
+        setState(() {
+          _peerTyping = false;
+        });
+      });
+    }
+  }
+
+  void _onComposerChanged(String value) {
+    final hasText = value.trim().isNotEmpty;
+    if (!hasText) {
+      _typingIdleTimer?.cancel();
+      _updateTypingState(false);
+      return;
+    }
+    _updateTypingState(true);
+    _typingIdleTimer?.cancel();
+    _typingIdleTimer = Timer(const Duration(milliseconds: 1400), () {
+      _updateTypingState(false);
+    });
+  }
+
+  void _updateTypingState(bool isTyping) {
+    if (_amTyping == isTyping) return;
+    _amTyping = isTyping;
+    unawaited(
+      widget.service.sendText(
+        _resolveOutgoingDeviceId(),
+        'btctl::${jsonEncode({'action': 'typing', 'isTyping': isTyping})}',
+      ),
     );
   }
 
   Future<void> _openWalkieTalkie({required bool isInitiator}) async {
     if (isInitiator) {
       await widget.service.sendText(
-        widget.deviceId,
+        _resolveOutgoingDeviceId(),
         'btcall::${jsonEncode({'type': 'start'})}',
       );
     }
@@ -3413,7 +3769,7 @@ class _BluetoothConversationScreenState
   Future<void> _openVoiceCall({required bool isInitiator}) async {
     if (isInitiator) {
       await widget.service.sendText(
-        widget.deviceId,
+        _resolveOutgoingDeviceId(),
         'btvoicecall::${jsonEncode({'type': 'invite'})}',
       );
     }
@@ -3440,10 +3796,11 @@ class _BluetoothConversationScreenState
     try {
       while (_incomingCallQueue.isNotEmpty) {
         final bytes = _incomingCallQueue.removeAt(0);
-        final dir = await getTemporaryDirectory();
+        final dir = await _runtimeTempDir();
         final path =
             '${dir.path}/bt_call_in_${DateTime.now().microsecondsSinceEpoch}.m4a';
         final file = File(path);
+        await file.parent.create(recursive: true);
         await file.writeAsBytes(bytes, flush: true);
         await _audioPlayer.play(DeviceFileSource(path));
         await _audioPlayer.onPlayerComplete.first;
@@ -3456,6 +3813,17 @@ class _BluetoothConversationScreenState
 
   @override
   void dispose() {
+    _typingIdleTimer?.cancel();
+    _peerTypingExpiryTimer?.cancel();
+    if (_amTyping) {
+      unawaited(
+        widget.service.sendText(
+          _resolveOutgoingDeviceId(),
+          'btctl::${jsonEncode({'action': 'typing', 'isTyping': false})}',
+        ),
+      );
+    }
+    _devicesSub?.cancel();
     _incomingSub?.cancel();
     _recordingTicker?.cancel();
     _amplitudeSub?.cancel();
@@ -3750,7 +4118,40 @@ class _BluetoothConversationScreenState
     return CupertinoPageScaffold(
       navigationBar: CupertinoNavigationBar(
         previousPageTitle: 'Mensajes',
-        middle: Text(widget.peerName),
+        middle: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(widget.peerName),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 7,
+                  height: 7,
+                  decoration: BoxDecoration(
+                    color: _peerPresence == 'background'
+                        ? const Color(0xFFFF9500)
+                        : CupertinoColors.activeGreen,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 5),
+                Text(
+                  _peerPresence == 'background'
+                      ? 'En segundo plano'
+                      : 'En linea',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: _peerPresence == 'background'
+                        ? const Color(0xFFFF9500)
+                        : CupertinoColors.activeGreen,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -3874,8 +4275,31 @@ class _BluetoothConversationScreenState
                         : ListView.builder(
                             controller: _scrollController,
                             padding: const EdgeInsets.fromLTRB(12, 16, 12, 84),
-                            itemCount: _messages.length,
+                            itemCount: _messages.length + (_peerTyping ? 1 : 0),
                             itemBuilder: (context, index) {
+                              if (_peerTyping && index == _messages.length) {
+                                return Padding(
+                                  padding: const EdgeInsets.only(
+                                    left: 4,
+                                    right: 4,
+                                    bottom: 8,
+                                  ),
+                                  child: Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                        vertical: 8,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFFE5E5EA),
+                                        borderRadius: BorderRadius.circular(16),
+                                      ),
+                                      child: const _TypingDots(),
+                                    ),
+                                  ),
+                                );
+                              }
                               final message = _messages[index];
                               return Row(
                                 mainAxisAlignment: message.isMe
@@ -4208,6 +4632,7 @@ class _BluetoothConversationScreenState
                               child: CupertinoTextField(
                                 controller: _controller,
                                 focusNode: _focusNode,
+                                onChanged: _onComposerChanged,
                                 minLines: 1,
                                 maxLines: 4,
                                 textInputAction: TextInputAction.send,
@@ -4265,6 +4690,64 @@ class WalkieTalkieScreen extends StatefulWidget {
   State<WalkieTalkieScreen> createState() => _WalkieTalkieScreenState();
 }
 
+class _TypingDots extends StatefulWidget {
+  const _TypingDots();
+
+  @override
+  State<_TypingDots> createState() => _TypingDotsState();
+}
+
+class _TypingDotsState extends State<_TypingDots>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 14,
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, _) {
+          final t = _controller.value;
+          return Row(
+            mainAxisSize: MainAxisSize.min,
+            children: List.generate(3, (index) {
+              final phase = (t - (index * 0.18)) % 1.0;
+              final opacity = 0.35 + (phase < 0.5 ? phase : (1 - phase)) * 1.2;
+              return Container(
+                width: 6,
+                height: 6,
+                margin: EdgeInsets.only(right: index == 2 ? 0 : 4),
+                decoration: BoxDecoration(
+                  color: const Color(
+                    0xFF8E8E93,
+                  ).withValues(alpha: opacity.clamp(0.25, 1.0)),
+                  shape: BoxShape.circle,
+                ),
+              );
+            }),
+          );
+        },
+      ),
+    );
+  }
+}
+
 class BluetoothVoiceCallScreen extends StatefulWidget {
   const BluetoothVoiceCallScreen({
     super.key,
@@ -4285,7 +4768,7 @@ class BluetoothVoiceCallScreen extends StatefulWidget {
 }
 
 class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
-  static const int _callChunkMs = 1100;
+  static const int _callChunkMs = 420;
   static const int _minBufferedChunksToStart = 1;
   final _recorder = AudioRecorder();
   final _player = AudioPlayer();
@@ -4300,6 +4783,7 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
   bool _captureLoopRunning = false;
   DateTime _callStartedAt = DateTime.now();
   Timer? _ticker;
+  Timer? _handshakeTimer;
   int _elapsedMs = 0;
   int _txSeq = 0;
   final String _callId = DateTime.now().millisecondsSinceEpoch.toString();
@@ -4311,22 +4795,35 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
     _peerAccepted = !widget.isInitiator;
     _callStartedAt = DateTime.now();
     _incomingSub = widget.service.messagesStream.listen((event) {
-      final raw = event.message.trim();
+      final raw = _extractBtEnvelopeVisibleText(event.message);
       if (!raw.startsWith('btvoicecall::')) return;
       try {
         final payload = raw.replaceFirst('btvoicecall::', '');
         final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
         final type = map['type']?.toString() ?? '';
+        if (type == 'invite' && !widget.isInitiator) {
+          _sendAcceptBurst();
+          return;
+        }
         if (type == 'accept') {
           if (!mounted) return;
           setState(() {
             _peerAccepted = true;
           });
+          _handshakeTimer?.cancel();
+          _handshakeTimer = null;
           _startCaptureLoop();
           return;
         }
         if (type == 'audio') {
           if (!_callActive) return;
+          if (!_peerAccepted && mounted) {
+            setState(() {
+              _peerAccepted = true;
+            });
+          }
+          _handshakeTimer?.cancel();
+          _handshakeTimer = null;
           final bytesRaw = map['bytes']?.toString() ?? '';
           final durationRaw = map['durationMs']?.toString() ?? '0';
           if (bytesRaw.isEmpty) return;
@@ -4360,12 +4857,38 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
         _elapsedMs = DateTime.now().difference(_callStartedAt).inMilliseconds;
       });
     });
-    if (!widget.isInitiator) {
+    if (widget.isInitiator) {
+      _startInviteHandshake();
+    } else {
+      _sendAcceptBurst();
+      _startCaptureLoop();
+    }
+  }
+
+  void _startInviteHandshake() {
+    _handshakeTimer?.cancel();
+    _handshakeTimer = Timer.periodic(const Duration(milliseconds: 900), (_) {
+      if (!_callActive || _peerAccepted) {
+        _handshakeTimer?.cancel();
+        _handshakeTimer = null;
+        return;
+      }
       widget.service.sendText(
         widget.deviceId,
-        'btvoicecall::${jsonEncode({'type': 'accept', 'callId': _callId})}',
+        'btvoicecall::${jsonEncode({'type': 'invite', 'callId': _callId})}',
       );
-      _startCaptureLoop();
+    });
+  }
+
+  void _sendAcceptBurst() {
+    for (var i = 0; i < 3; i++) {
+      Future<void>.delayed(Duration(milliseconds: i * 220), () {
+        if (!_callActive) return;
+        widget.service.sendText(
+          widget.deviceId,
+          'btvoicecall::${jsonEncode({'type': 'accept', 'callId': _callId})}',
+        );
+      });
     }
   }
 
@@ -4384,12 +4907,16 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
         }
         final hasPermission = await _recorder.hasPermission();
         if (!hasPermission) {
+          if (mounted && Platform.isMacOS) {
+            debugPrint('Sin permiso de microfono en macOS para llamada BT');
+          }
           await Future<void>.delayed(const Duration(milliseconds: 600));
           continue;
         }
-        final dir = await getTemporaryDirectory();
+        final dir = await _runtimeTempDir();
         final path =
             '${dir.path}/voice_call_chunk_${DateTime.now().microsecondsSinceEpoch}.m4a';
+        await File(path).parent.create(recursive: true);
         await _recorder.start(
           const RecordConfig(
             encoder: AudioEncoder.aacLc,
@@ -4427,9 +4954,10 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
     try {
       while (_incomingQueue.isNotEmpty && _speakerEnabled) {
         final bytes = _incomingQueue.removeAt(0);
-        final dir = await getTemporaryDirectory();
+        final dir = await _runtimeTempDir();
         final path =
             '${dir.path}/voice_call_in_${DateTime.now().microsecondsSinceEpoch}.m4a';
+        await File(path).parent.create(recursive: true);
         await File(path).writeAsBytes(bytes, flush: true);
         await _player.play(DeviceFileSource(path));
         await _player.onPlayerComplete.first;
@@ -4472,6 +5000,7 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
       );
     }
     _ticker?.cancel();
+    _handshakeTimer?.cancel();
     _incomingSub?.cancel();
     _recorder.dispose();
     _player.dispose();
@@ -4579,7 +5108,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
   void initState() {
     super.initState();
     _incomingSub = widget.service.messagesStream.listen((event) {
-      final raw = event.message.trim();
+      final raw = _extractBtEnvelopeVisibleText(event.message);
       if (!raw.startsWith('btcallvoice::')) return;
       try {
         final payload = raw.replaceFirst('btcallvoice::', '');
@@ -4610,7 +5139,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
     if (_pttRecording) return;
     final hasPermission = await _audioRecorder.hasPermission();
     if (!hasPermission) return;
-    final dir = await getTemporaryDirectory();
+    final dir = await _runtimeTempDir();
     final path =
         '${dir.path}/walkie_ptt_${DateTime.now().millisecondsSinceEpoch}.m4a';
     await _audioRecorder.start(
@@ -4683,9 +5212,10 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
     try {
       while (_incomingQueue.isNotEmpty) {
         final bytes = _incomingQueue.removeAt(0);
-        final dir = await getTemporaryDirectory();
+        final dir = await _runtimeTempDir();
         final path =
             '${dir.path}/walkie_in_${DateTime.now().microsecondsSinceEpoch}.m4a';
+        await File(path).parent.create(recursive: true);
         await File(path).writeAsBytes(bytes, flush: true);
         await _audioPlayer.play(DeviceFileSource(path));
         await _audioPlayer.onPlayerComplete.first;
@@ -4910,16 +5440,22 @@ class NearbyChatMeta {
     required this.lastMessage,
     required this.lastMessageAt,
     required this.hasUnread,
+    required this.peerPresence,
+    required this.peerPresenceAt,
   });
 
   final String lastMessage;
   final DateTime? lastMessageAt;
   final bool hasUnread;
+  final String peerPresence;
+  final DateTime? peerPresenceAt;
 
   Map<String, dynamic> toJson() => {
     'lastMessage': lastMessage,
     'lastMessageAt': lastMessageAt?.toIso8601String(),
     'hasUnread': hasUnread,
+    'peerPresence': peerPresence,
+    'peerPresenceAt': peerPresenceAt?.toIso8601String(),
   };
 
   static NearbyChatMeta? fromJson(dynamic raw) {
@@ -4931,6 +5467,10 @@ class NearbyChatMeta {
           ? null
           : DateTime.tryParse(map['lastMessageAt'].toString())?.toLocal(),
       hasUnread: map['hasUnread'] == true,
+      peerPresence: map['peerPresence']?.toString() ?? 'online',
+      peerPresenceAt: map['peerPresenceAt'] == null
+          ? null
+          : DateTime.tryParse(map['peerPresenceAt'].toString())?.toLocal(),
     );
   }
 }
@@ -4968,4 +5508,30 @@ String _formatTime(DateTime timestamp) {
   final hour = timestamp.hour.toString().padLeft(2, '0');
   final minute = timestamp.minute.toString().padLeft(2, '0');
   return '$hour:$minute';
+}
+
+Future<Directory> _runtimeTempDir() async {
+  try {
+    if (!Platform.isMacOS) {
+      final dir = await getTemporaryDirectory();
+      await dir.create(recursive: true);
+      return dir;
+    }
+  } catch (_) {}
+  final fallback = Directory('${Directory.systemTemp.path}/vmessages');
+  await fallback.create(recursive: true);
+  return fallback;
+}
+
+String _extractBtEnvelopeVisibleText(String raw) {
+  final clean = raw.trim();
+  if (clean.isEmpty) return '';
+  try {
+    final decoded = jsonDecode(clean);
+    if (decoded is Map) {
+      final message = decoded['message']?.toString().trim() ?? '';
+      if (message.isNotEmpty) return message;
+    }
+  } catch (_) {}
+  return clean;
 }

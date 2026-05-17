@@ -28,6 +28,8 @@
 	<string>MainMenu</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Necesitamos red local para descubrir y conectar dispositivos cercanos.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Necesitamos acceso al microfono para enviar audios y llamadas por Bluetooth.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_vmsgchat._tcp</string>
