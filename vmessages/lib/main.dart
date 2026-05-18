@@ -21,6 +21,9 @@ const _supabaseUrl = 'https://jziefknvztxxllogiwba.supabase.co';
 const _supabaseAnonKey =
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp6aWVma252enR4eGxsb2dpd2JhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2MjI1MzUsImV4cCI6MjA4NTE5ODUzNX0.uQzvXMfLT4spxhTjerxdarcMR8-f5l2KDpby-9Q1bAg';
 const _darkModePrefsKey = 'app_dark_mode_v1';
+const _guestBtModeEnabledPrefsKey = 'guest_bt_mode_enabled_v1';
+const _guestBtNamePrefsKey = 'guest_bt_name_v1';
+const _guestBtPhonePrefsKey = 'guest_bt_phone_v1';
 final ValueNotifier<bool> _darkModeNotifier = ValueNotifier<bool>(false);
 
 Future<void> main() async {
@@ -84,9 +87,114 @@ class RootSessionGate extends StatefulWidget {
 
 class _RootSessionGateState extends State<RootSessionGate> {
   bool _useBluetoothOnlyFallback = false;
+  bool _guestBootstrapLoaded = false;
+  String? _guestName;
+  String? _guestPhone;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadGuestBluetoothSession();
+  }
+
+  Future<void> _loadGuestBluetoothSession() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_guestBtModeEnabledPrefsKey) ?? false;
+    final name = prefs.getString(_guestBtNamePrefsKey)?.trim() ?? '';
+    final phone = prefs.getString(_guestBtPhonePrefsKey)?.trim() ?? '';
+    if (!mounted) return;
+    setState(() {
+      _guestBootstrapLoaded = true;
+      _useBluetoothOnlyFallback = enabled;
+      _guestName = name.isEmpty ? null : name;
+      _guestPhone = phone.isEmpty ? null : phone;
+    });
+  }
+
+  Future<Map<String, String>?> _promptGuestIdentity() async {
+    final nameController = TextEditingController(text: _guestName ?? '');
+    final phoneController = TextEditingController(text: _guestPhone ?? '');
+    final result = await showCupertinoDialog<Map<String, String>>(
+      context: context,
+      builder: (context) {
+        return CupertinoAlertDialog(
+          title: const Text('Perfil invitado'),
+          content: Column(
+            children: [
+              const SizedBox(height: 10),
+              CupertinoTextField(
+                controller: nameController,
+                placeholder: 'Nombre visible',
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+              ),
+              const SizedBox(height: 8),
+              CupertinoTextField(
+                controller: phoneController,
+                keyboardType: TextInputType.phone,
+                placeholder: 'Telefono',
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            CupertinoDialogAction(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancelar'),
+            ),
+            CupertinoDialogAction(
+              isDefaultAction: true,
+              onPressed: () {
+                final name = nameController.text.trim();
+                final phone = phoneController.text.trim();
+                if (name.isEmpty || phone.isEmpty) return;
+                Navigator.of(context).pop(<String, String>{
+                  'name': name,
+                  'phone': phone,
+                });
+              },
+              child: const Text('Continuar'),
+            ),
+          ],
+        );
+      },
+    );
+    nameController.dispose();
+    phoneController.dispose();
+    return result;
+  }
+
+  Future<void> _enableGuestBluetoothMode() async {
+    final currentName = _guestName?.trim() ?? '';
+    final currentPhone = _guestPhone?.trim() ?? '';
+    final identity = (currentName.isNotEmpty && currentPhone.isNotEmpty)
+        ? <String, String>{'name': currentName, 'phone': currentPhone}
+        : await _promptGuestIdentity();
+    if (identity == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_guestBtModeEnabledPrefsKey, true);
+    await prefs.setString(_guestBtNamePrefsKey, identity['name'] ?? '');
+    await prefs.setString(_guestBtPhonePrefsKey, identity['phone'] ?? '');
+    if (!mounted) return;
+    setState(() {
+      _useBluetoothOnlyFallback = true;
+      _guestName = identity['name'];
+      _guestPhone = identity['phone'];
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
+    if (!_guestBootstrapLoaded) {
+      return const CupertinoPageScaffold(
+        child: Center(child: CupertinoActivityIndicator(radius: 14)),
+      );
+    }
     final client = Supabase.instance.client;
     return StreamBuilder<AuthState>(
       stream: client.auth.onAuthStateChange,
@@ -98,7 +206,11 @@ class _RootSessionGateState extends State<RootSessionGate> {
         final session = snapshot.data?.session ?? client.auth.currentSession;
         if (session == null) {
           if (_useBluetoothOnlyFallback) {
-            return const MessagesHomePage(bluetoothOnlyMode: true);
+            return MessagesHomePage(
+              bluetoothOnlyMode: true,
+              guestDisplayName: _guestName,
+              guestPhone: _guestPhone,
+            );
           }
           return CupertinoPageScaffold(
             child: SafeArea(
@@ -110,11 +222,7 @@ class _RootSessionGateState extends State<RootSessionGate> {
                     child: SizedBox(
                       width: double.infinity,
                       child: CupertinoButton(
-                        onPressed: () {
-                          setState(() {
-                            _useBluetoothOnlyFallback = true;
-                          });
-                        },
+                        onPressed: _enableGuestBluetoothMode,
                         child: const Text('Usar solo Bluetooth (sin cuenta)'),
                       ),
                     ),
@@ -439,9 +547,16 @@ class _AuthenticatedBootstrapState extends State<AuthenticatedBootstrap> {
 }
 
 class MessagesHomePage extends StatefulWidget {
-  const MessagesHomePage({super.key, this.bluetoothOnlyMode = false});
+  const MessagesHomePage({
+    super.key,
+    this.bluetoothOnlyMode = false,
+    this.guestDisplayName,
+    this.guestPhone,
+  });
 
   final bool bluetoothOnlyMode;
+  final String? guestDisplayName;
+  final String? guestPhone;
 
   @override
   State<MessagesHomePage> createState() => _MessagesHomePageState();
@@ -493,6 +608,17 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   String? get _currentUserId => _client.auth.currentUser?.id;
   bool get _cloudChatEnabled =>
       !widget.bluetoothOnlyMode && _currentUserId != null;
+  String get _bluetoothLocalDisplayName {
+    final guestName = widget.guestDisplayName?.trim() ?? '';
+    final guestPhone = widget.guestPhone?.trim() ?? '';
+    if (guestName.isNotEmpty && guestPhone.isNotEmpty) {
+      return '$guestName · $guestPhone';
+    }
+    if (guestName.isNotEmpty) return guestName;
+    if (guestPhone.isNotEmpty) return guestPhone;
+    return _client.auth.currentUser?.userMetadata?['phone']?.toString() ??
+        'iPhone';
+  }
 
   Future<List<ConversationSummary>> _loadConversationSummaries(
     List<Map<String, dynamic>> membershipRows,
@@ -791,10 +917,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       _btError = null;
     });
     try {
-      final phone =
-          _client.auth.currentUser?.userMetadata?['phone']?.toString() ??
-          'iPhone';
-      await _bluetoothService.start(displayName: phone);
+      await _bluetoothService.start(displayName: _bluetoothLocalDisplayName);
       _bluetoothService.devicesStream.listen((devices) {
         if (!mounted) return;
         final now = DateTime.now();
@@ -1479,9 +1602,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         (_bluetoothService.hasConnectedPeers || inactivitySeconds < 22);
     if (shouldSkip) return;
     try {
-      final phone =
-          _client.auth.currentUser?.userMetadata?['phone']?.toString() ??
-          'iPhone';
+      final phone = _bluetoothLocalDisplayName;
       await _bluetoothService.stop();
       await _bluetoothService.start(displayName: phone);
     } catch (_) {}
@@ -2962,6 +3083,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _codeController.dispose();
     super.dispose();
   }
+
 
   Future<void> _loadProfile() async {
     final user = _client.auth.currentUser;
@@ -4579,8 +4701,14 @@ class _BluetoothConversationScreenState
   String? _replyToMessageId;
   String? _replyToPreview;
   Timer? _resumeRelinkTimer;
+  Timer? _pendingRetryTimer;
   int _resumeRelinkAttempts = 0;
+  bool _immediateRelinkInFlight = false;
+  DateTime _lastImmediateRelinkAt = DateTime.fromMillisecondsSinceEpoch(0);
   AppLifecycleState _screenLifecycleState = AppLifecycleState.resumed;
+  final Set<String> _pendingDeliveryMessageIds = <String>{};
+  final Map<String, String> _pendingPayloadByMessageId = <String, String>{};
+  bool _retryInFlight = false;
   String _newBtMessageId() =>
       'bt_${DateTime.now().microsecondsSinceEpoch}_${DateTime.now().millisecondsSinceEpoch % 1000}';
 
@@ -4613,6 +4741,8 @@ class _BluetoothConversationScreenState
         if (current.messageId != id) continue;
         if (current.isDelivered) return true;
         _messages[i] = current.copyWith(isDelivered: true);
+        _pendingDeliveryMessageIds.remove(id);
+        _pendingPayloadByMessageId.remove(id);
         changed = true;
         break;
       }
@@ -4778,6 +4908,7 @@ class _BluetoothConversationScreenState
       }
     });
     _connectIfNeeded();
+    _startPendingDeliveryPump();
     _audioPlayer.onPlayerComplete.listen((_) {
       if (!mounted) return;
       setState(() {
@@ -4800,9 +4931,117 @@ class _BluetoothConversationScreenState
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _screenLifecycleState = state;
-    if (state != AppLifecycleState.resumed) return;
-    _startResumeRelink();
-    unawaited(_sendLatestSeenIfAny());
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_triggerImmediateRelink(force: true));
+      _startResumeRelink();
+      unawaited(_sendLatestSeenIfAny());
+      unawaited(_retryPendingDeliveries());
+      return;
+    }
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      unawaited(_retryPendingDeliveries());
+    }
+  }
+
+  Future<void> _triggerImmediateRelink({bool force = false}) async {
+    if (_immediateRelinkInFlight) return;
+    final now = DateTime.now();
+    if (!force &&
+        now.difference(_lastImmediateRelinkAt) <
+            const Duration(milliseconds: 1200)) {
+      return;
+    }
+    _immediateRelinkInFlight = true;
+    _lastImmediateRelinkAt = now;
+    try {
+      await widget.service.refreshPresence();
+      final targets = _candidateOutgoingPeerIds();
+      for (final target in targets) {
+        try {
+          await widget.service.invite(target, deviceName: widget.peerName);
+        } catch (_) {}
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+      }
+      await _retryPendingDeliveries();
+    } catch (_) {
+      _lastImmediateRelinkAt = DateTime.now();
+    } finally {
+      _immediateRelinkInFlight = false;
+      _lastImmediateRelinkAt = DateTime.now();
+    }
+  }
+
+  void _startPendingDeliveryPump() {
+    _pendingRetryTimer?.cancel();
+    _pendingRetryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      unawaited(_retryPendingDeliveries());
+    });
+    unawaited(_retryPendingDeliveries());
+  }
+
+  String? _buildOutgoingPayloadFromMessage(_BluetoothChatMessage message) {
+    final id = message.messageId.trim();
+    if (id.isEmpty) return null;
+    if (message.photoBytes != null) {
+      return 'btmsg::${jsonEncode({
+            'id': id,
+            'type': 'photo',
+            'bytes': base64Encode(message.photoBytes!),
+            'caption': message.caption ?? '',
+            'replyToMessageId': message.replyToMessageId,
+            'replyToPreview': message.replyToPreview,
+          })}';
+    }
+    if (message.audioBytes != null) {
+      return 'btmsg::${jsonEncode({
+            'id': id,
+            'type': 'voice',
+            'bytes': base64Encode(message.audioBytes!),
+            'durationMs': message.audioDurationMs ?? 0,
+            'replyToMessageId': message.replyToMessageId,
+            'replyToPreview': message.replyToPreview,
+          })}';
+    }
+    return 'btmsg::${jsonEncode({
+          'id': id,
+          'type': 'text',
+          'text': message.text,
+          'replyToMessageId': message.replyToMessageId,
+          'replyToPreview': message.replyToPreview,
+        })}';
+  }
+
+  Future<void> _retryPendingDeliveries() async {
+    if (_retryInFlight) return;
+    if (_pendingDeliveryMessageIds.isEmpty) return;
+    _retryInFlight = true;
+    try {
+      final pendingIds = _pendingDeliveryMessageIds.toList();
+      for (final id in pendingIds) {
+        final idx = _messages.lastIndexWhere(
+          (m) => m.isMe && m.messageId == id && !m.isDelivered,
+        );
+        if (idx < 0) {
+          _pendingDeliveryMessageIds.remove(id);
+          _pendingPayloadByMessageId.remove(id);
+          continue;
+        }
+        final payload =
+            _pendingPayloadByMessageId[id] ??
+            _buildOutgoingPayloadFromMessage(_messages[idx]);
+        if (payload == null || payload.isEmpty) {
+          _pendingDeliveryMessageIds.remove(id);
+          _pendingPayloadByMessageId.remove(id);
+          continue;
+        }
+        _pendingPayloadByMessageId[id] = payload;
+        await _sendTextSmart(payload);
+        await Future<void>.delayed(const Duration(milliseconds: 220));
+      }
+    } finally {
+      _retryInFlight = false;
+    }
   }
 
   void _startResumeRelink() {
@@ -4952,6 +5191,8 @@ class _BluetoothConversationScreenState
         await _sendTextSmart(
           'btmsg::${jsonEncode({'id': id, 'type': 'text', 'text': text, 'replyToMessageId': replyToId, 'replyToPreview': replyToPreview})}',
         );
+        _pendingDeliveryMessageIds.add(id);
+        _pendingPayloadByMessageId[id] = 'btmsg::${jsonEncode({'id': id, 'type': 'text', 'text': text, 'replyToMessageId': replyToId, 'replyToPreview': replyToPreview})}';
         if (!mounted) return;
         setState(() {
             _messages.add(
@@ -5010,6 +5251,8 @@ class _BluetoothConversationScreenState
       'replyToPreview': replyToPreview,
     });
     await _sendTextSmart('btmsg::$payload');
+    _pendingDeliveryMessageIds.add(id);
+    _pendingPayloadByMessageId[id] = 'btmsg::$payload';
     if (!mounted) return;
     setState(() {
       _messages.add(
@@ -5050,6 +5293,8 @@ class _BluetoothConversationScreenState
       'replyToPreview': replyToPreview,
     });
     await _sendTextSmart('btmsg::$payload');
+    _pendingDeliveryMessageIds.add(id);
+    _pendingPayloadByMessageId[id] = 'btmsg::$payload';
     if (!mounted) return;
     setState(() {
       _messages.add(
@@ -5369,6 +5614,7 @@ class _BluetoothConversationScreenState
             _onlinePeerDeviceId = senderId;
           }
         }
+        unawaited(_triggerImmediateRelink());
         if (!mounted) return true;
         final shouldUpdateAvatar = incomingAvatarHash?.isNotEmpty == true
             ? incomingAvatarHash != _peerAvatarHash
@@ -5583,6 +5829,7 @@ class _BluetoothConversationScreenState
     _typingIdleTimer?.cancel();
     _peerTypingExpiryTimer?.cancel();
     _resumeRelinkTimer?.cancel();
+    _pendingRetryTimer?.cancel();
     if (_amTyping) {
       unawaited(
         _sendTextSmart(
@@ -5704,7 +5951,18 @@ class _BluetoothConversationScreenState
           ..addAll(loaded);
         _loadingHistory = false;
       });
+      for (final m in loaded) {
+        if (m.isMe && !m.isDelivered) {
+          final id = m.messageId.trim();
+          if (id.isEmpty) continue;
+          final payload = _buildOutgoingPayloadFromMessage(m);
+          if (payload == null || payload.isEmpty) continue;
+          _pendingDeliveryMessageIds.add(id);
+          _pendingPayloadByMessageId[id] = payload;
+        }
+      }
       _animateToBottom();
+      unawaited(_retryPendingDeliveries());
     } catch (_) {
       if (!mounted) return;
       setState(() {
