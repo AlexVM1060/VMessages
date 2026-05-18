@@ -36,6 +36,7 @@ final lnp.FlutterLocalNotificationsPlugin _localNotifications =
 
 Future<void> _initLocalNotifications() async {
   const initSettings = lnp.InitializationSettings(
+    android: lnp.AndroidInitializationSettings('@mipmap/ic_launcher'),
     iOS: lnp.DarwinInitializationSettings(),
     macOS: lnp.DarwinInitializationSettings(),
   );
@@ -1072,13 +1073,44 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           ? peer.deviceName.trim()
           : (peer.deviceId.trim().isEmpty ? 'Bluetooth' : peer.deviceId.trim());
 
-      const details = lnp.NotificationDetails(
-        iOS: lnp.DarwinNotificationDetails(
-          presentAlert: true,
-          presentBadge: true,
-          presentSound: true,
-        ),
-        macOS: lnp.DarwinNotificationDetails(
+      final isIncomingCallInvite = eventType == 'btcall_invite';
+      final details = lnp.NotificationDetails(
+        android: isIncomingCallInvite
+            ? const lnp.AndroidNotificationDetails(
+                'vmessages_incoming_call_v2',
+                'Incoming Calls',
+                channelDescription: 'Llamadas entrantes Bluetooth',
+                importance: lnp.Importance.max,
+                priority: lnp.Priority.max,
+                category: lnp.AndroidNotificationCategory.call,
+                fullScreenIntent: true,
+                ongoing: true,
+                autoCancel: false,
+                playSound: true,
+                audioAttributesUsage:
+                    lnp.AudioAttributesUsage.notificationRingtone,
+              )
+            : const lnp.AndroidNotificationDetails(
+                'vmessages_events_v1',
+                'Events',
+                channelDescription: 'Eventos Bluetooth',
+                importance: lnp.Importance.high,
+                priority: lnp.Priority.high,
+              ),
+        iOS: isIncomingCallInvite
+            ? const lnp.DarwinNotificationDetails(
+                presentAlert: true,
+                presentBadge: true,
+                presentSound: true,
+                sound: 'incoming_call.caf',
+                interruptionLevel: lnp.InterruptionLevel.timeSensitive,
+              )
+            : const lnp.DarwinNotificationDetails(
+                presentAlert: true,
+                presentBadge: true,
+                presentSound: true,
+              ),
+        macOS: const lnp.DarwinNotificationDetails(
           presentAlert: true,
           presentBadge: true,
           presentSound: true,
