@@ -409,13 +409,15 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   static const String _pendingWalkieInvitePrefsKey = 'bt_pending_walkie_invite_v1';
   bool _btNotifDedupeLoaded = false;
   Map<String, String>? _pendingWalkieInvite;
-  bool _walkieInviteDialogOpen = false;
   bool get _isApplePeerSupported => Platform.isIOS || Platform.isMacOS;
   DateTime _lastRealtimeResubscribeAt = DateTime.fromMillisecondsSinceEpoch(0);
   final _iosBackgroundBridge = IOSBackgroundTaskBridge();
   final _iosSilentAudioBridge = IOSSilentAudioBridge();
   String? _myBluetoothAvatarBase64;
   String? _myBluetoothAvatarHash;
+  String? _inAppMessageBannerTitle;
+  String? _inAppMessageBannerBody;
+  Timer? _inAppMessageBannerTimer;
 
   String get _currentUserId => _client.auth.currentUser!.id;
 
@@ -568,7 +570,27 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       _stopIOSBackgroundExecution();
       _bluetoothService.stop();
     }
+    _inAppMessageBannerTimer?.cancel();
     super.dispose();
+  }
+
+  void _showInAppMessageBanner({
+    required String title,
+    required String body,
+  }) {
+    if (!mounted) return;
+    _inAppMessageBannerTimer?.cancel();
+    setState(() {
+      _inAppMessageBannerTitle = title;
+      _inAppMessageBannerBody = body.trim().isEmpty ? 'Nuevo mensaje' : body;
+    });
+    _inAppMessageBannerTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted) return;
+      setState(() {
+        _inAppMessageBannerTitle = null;
+        _inAppMessageBannerBody = null;
+      });
+    });
   }
 
   Future<void> _initBluetoothNearby() async {
@@ -745,7 +767,6 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     Map<String, dynamic> row,
   ) async {
     try {
-      if (_appLifecycleState == AppLifecycleState.resumed) return;
       final messageId = row['id']?.toString() ?? '';
       if (messageId.isEmpty) return;
       if (_recentNotifiedMessageIds.contains(messageId)) return;
@@ -780,6 +801,15 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           ? 'Nuevo mensaje'
           : rawBody;
 
+      if (_appLifecycleState == AppLifecycleState.resumed) {
+        _showInAppMessageBanner(title: senderName, body: body);
+        _recentNotifiedMessageIds.add(messageId);
+        if (_recentNotifiedMessageIds.length > 300) {
+          _recentNotifiedMessageIds.remove(_recentNotifiedMessageIds.first);
+        }
+        return;
+      }
+
       const details = lnp.NotificationDetails(
         iOS: lnp.DarwinNotificationDetails(
           presentAlert: true,
@@ -812,7 +842,6 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     required String rawIncoming,
   }) async {
     try {
-      if (_appLifecycleState == AppLifecycleState.resumed) return;
       if (!_btNotifDedupeLoaded) {
         await _loadBtNotificationDedupeCache();
       }
@@ -832,6 +861,16 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           : (peer.deviceId.trim().isEmpty ? 'Bluetooth' : peer.deviceId.trim());
 
       final preview = _notificationPreviewFromBluetoothBody(body);
+
+      if (_appLifecycleState == AppLifecycleState.resumed) {
+        _showInAppMessageBanner(title: peerName, body: preview);
+        _recentBtNotificationKeys.add(key);
+        if (_recentBtNotificationKeys.length > 250) {
+          _recentBtNotificationKeys.removeAt(0);
+        }
+        await _saveBtNotificationDedupeCache();
+        return;
+      }
 
       const details = lnp.NotificationDetails(
         iOS: lnp.DarwinNotificationDetails(
@@ -903,10 +942,8 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       _pendingWalkieInvite = <String, String>{
         'deviceId': deviceId,
         'inviteId': map['inviteId']?.toString().trim() ?? '',
+        'peerName': map['peerName']?.toString().trim() ?? '',
       };
-      if (mounted && _appLifecycleState == AppLifecycleState.resumed) {
-        unawaited(_presentPendingWalkieInviteIfNeeded());
-      }
     } catch (_) {}
   }
 
@@ -921,6 +958,19 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       await prefs.setString(_pendingWalkieInvitePrefsKey, jsonEncode(pending));
     } catch (_) {}
   }
+
+  Map<String, String>? _consumePendingWalkieInviteForDevice(String deviceId) {
+    final pending = _pendingWalkieInvite;
+    if (pending == null) return null;
+    final pendingDeviceId = pending['deviceId']?.trim() ?? '';
+    final cleanDeviceId = deviceId.trim();
+    if (pendingDeviceId.isEmpty || cleanDeviceId.isEmpty) return null;
+    if (pendingDeviceId != cleanDeviceId) return null;
+    _pendingWalkieInvite = null;
+    unawaited(_savePendingWalkieInvite());
+    return pending;
+  }
+
 
   String _peerLabelFromDeviceId(String deviceId) {
     final cleanId = deviceId.trim();
@@ -937,65 +987,6 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       if (name.isNotEmpty) return name;
     }
     return cleanId;
-  }
-
-  Future<void> _presentPendingWalkieInviteIfNeeded() async {
-    if (!mounted) return;
-    if (_appLifecycleState != AppLifecycleState.resumed) return;
-    if (_walkieInviteDialogOpen) return;
-    final pending = _pendingWalkieInvite;
-    if (pending == null) return;
-    final deviceId = pending['deviceId']?.trim() ?? '';
-    if (deviceId.isEmpty) return;
-
-    _walkieInviteDialogOpen = true;
-    final peerName = _peerLabelFromDeviceId(deviceId);
-    final decision = await showCupertinoDialog<String>(
-      context: context,
-      builder: (dialogContext) => CupertinoAlertDialog(
-        title: const Text('Walkie Talkie'),
-        content: Text('$peerName quiere hacer Walkie Talkie contigo. ¿Quieres unirte?'),
-        actions: [
-          CupertinoDialogAction(
-            isDestructiveAction: true,
-            onPressed: () => Navigator.of(dialogContext).pop('reject'),
-            child: const Text('Rechazar'),
-          ),
-          CupertinoDialogAction(
-            isDefaultAction: true,
-            onPressed: () => Navigator.of(dialogContext).pop('accept'),
-            child: const Text('Aceptar'),
-          ),
-        ],
-      ),
-    );
-    _walkieInviteDialogOpen = false;
-    if (!mounted) return;
-
-    final inviteId = pending['inviteId']?.trim() ?? '';
-    _pendingWalkieInvite = null;
-    await _savePendingWalkieInvite();
-    if (!mounted) return;
-
-    if (decision == 'accept') {
-      await Navigator.of(context, rootNavigator: true).push(
-        CupertinoPageRoute<void>(
-          builder: (_) => WalkieTalkieScreen(
-            service: _bluetoothService,
-            deviceId: deviceId,
-            peerName: peerName,
-            sendStartSignalOnOpen: false,
-            inviteId: inviteId,
-            isJoiner: true,
-          ),
-        ),
-      );
-    } else {
-      await _bluetoothService.sendText(
-        deviceId,
-        'btcall::${jsonEncode({'type': 'end', 'inviteId': inviteId})}',
-      );
-    }
   }
 
   String _buildBluetoothNotificationKey({
@@ -1285,7 +1276,6 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       if (state == AppLifecycleState.resumed) {
         await _stopIOSBackgroundExecution();
         _resubscribeMessageNotifications();
-        unawaited(_presentPendingWalkieInviteIfNeeded());
       }
       await _broadcastBluetoothPresence();
       if (!_isApplePeerSupported) return;
@@ -1440,6 +1430,11 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         barrierColor: const Color(0x44000000),
         transitionDuration: const Duration(milliseconds: 180),
         pageBuilder: (dialogContext, animation, secondaryAnimation) {
+          final isDark = CupertinoTheme.of(dialogContext).brightness == Brightness.dark;
+          final cardBg = isDark ? const Color(0xFF1C1C1E) : const Color(0xFFF5F5F7);
+          final avatarBg = isDark ? const Color(0xFF2C2C2E) : const Color(0xFFD1D1D6);
+          final titleColor = isDark ? const Color(0xFFAEAEB2) : const Color(0xFF636366);
+          final nameColor = isDark ? const Color(0xFFF2F2F7) : const Color(0xFF1C1C1E);
           return SafeArea(
             child: Align(
               alignment: Alignment.topCenter,
@@ -1447,7 +1442,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                 margin: const EdgeInsets.fromLTRB(12, 10, 12, 0),
                 padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFF5F5F7),
+                  color: cardBg,
                   borderRadius: BorderRadius.circular(16),
                 ),
                 child: Row(
@@ -1455,17 +1450,17 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                     Container(
                       width: 42,
                       height: 42,
-                      decoration: const BoxDecoration(
-                        color: Color(0xFFD1D1D6),
+                      decoration: BoxDecoration(
+                        color: avatarBg,
                         shape: BoxShape.circle,
                       ),
                       alignment: Alignment.center,
                       child: Text(
                         peerLabel.characters.first.toUpperCase(),
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 18,
                           fontWeight: FontWeight.w700,
-                          color: Color(0xFF1C1C1E),
+                          color: nameColor,
                         ),
                       ),
                     ),
@@ -1475,20 +1470,20 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          const Text(
+                          Text(
                             'Llamada de Bluetooth',
                             style: TextStyle(
                               fontSize: 12,
-                              color: Color(0xFF636366),
+                              color: titleColor,
                               fontWeight: FontWeight.w500,
                             ),
                           ),
                           const SizedBox(height: 2),
                           Text(
                             peerLabel,
-                            style: const TextStyle(
+                            style: TextStyle(
                               fontSize: 17,
-                              color: Color(0xFF1C1C1E),
+                              color: nameColor,
                               fontWeight: FontWeight.w700,
                             ),
                           ),
@@ -1584,16 +1579,12 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
       final type = map['type']?.toString() ?? '';
       if (type != 'start') return true;
+      final _ = rawIncomingDeviceId;
       final resolvedId = _resolveNearbyDeviceId(incomingDeviceId);
-      final rawId = rawIncomingDeviceId.trim();
-      final fallbackPhoneLike =
-          RegExp(r'^\+?[0-9]{6,}$').hasMatch(resolvedId.trim());
-      final effectiveId = fallbackPhoneLike && rawId.isNotEmpty
-          ? rawId
-          : resolvedId;
       final inviteId = map['inviteId']?.toString().trim() ?? '';
+      final peerName = _peerLabelFromDeviceId(resolvedId);
       await _showBluetoothEventNotificationIfNeeded(
-        deviceId: effectiveId,
+        deviceId: resolvedId,
         eventType: 'btwalkie_invite',
         title: 'Walkie Talkie',
         body: 'Quiere hablar contigo',
@@ -1601,8 +1592,9 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       );
       if (_appLifecycleState != AppLifecycleState.resumed) {
         _pendingWalkieInvite = <String, String>{
-          'deviceId': effectiveId,
+          'deviceId': resolvedId,
           'inviteId': inviteId,
+          'peerName': peerName,
         };
         await _savePendingWalkieInvite();
       }
@@ -2185,50 +2177,106 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         ),
       ),
       child: SafeArea(
-        child: StreamBuilder<List<Map<String, dynamic>>>(
-          stream: _membershipStream,
-          builder: (context, membershipSnapshot) {
-            if (membershipSnapshot.hasError) {
-              return Center(child: Text('Error: ${membershipSnapshot.error}'));
-            }
-            if (!membershipSnapshot.hasData) {
-              return const Center(
-                child: CupertinoActivityIndicator(radius: 14),
-              );
-            }
+        child: Column(
+          children: [
+            if (_inAppMessageBannerTitle != null &&
+                _inAppMessageBannerBody != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFEAF2FF),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        CupertinoIcons.bell_fill,
+                        size: 18,
+                        color: Color(0xFF0A84FF),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              _inAppMessageBannerTitle!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                                color: Color(0xFF0A84FF),
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              _inAppMessageBannerBody!,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            Expanded(
+              child: StreamBuilder<List<Map<String, dynamic>>>(
+                stream: _membershipStream,
+                builder: (context, membershipSnapshot) {
+                  if (membershipSnapshot.hasError) {
+                    return Center(child: Text('Error: ${membershipSnapshot.error}'));
+                  }
+                  if (!membershipSnapshot.hasData) {
+                    return const Center(
+                      child: CupertinoActivityIndicator(radius: 14),
+                    );
+                  }
 
-            final membershipRows = membershipSnapshot.data!;
-            final conversationIds = membershipRows
-                .map((row) => row['conversation_id'].toString())
-                .toList();
+                  final membershipRows = membershipSnapshot.data!;
+                  final conversationIds = membershipRows
+                      .map((row) => row['conversation_id'].toString())
+                      .toList();
 
-            if (conversationIds.isEmpty && _visibleNearbyDevices().isEmpty) {
-              return _buildHomePlaceholder();
-            }
+                  if (conversationIds.isEmpty && _visibleNearbyDevices().isEmpty) {
+                    return _buildHomePlaceholder();
+                  }
 
-            return FutureBuilder<List<ConversationSummary>>(
-              future: _loadConversationSummaries(membershipRows),
-              builder: (context, summarySnapshot) {
-                if (summarySnapshot.hasError) {
-                  return Center(child: Text('Error: ${summarySnapshot.error}'));
-                }
-                if (!summarySnapshot.hasData) {
-                  return const Center(
-                    child: CupertinoActivityIndicator(radius: 14),
+                  return FutureBuilder<List<ConversationSummary>>(
+                    future: _loadConversationSummaries(membershipRows),
+                    builder: (context, summarySnapshot) {
+                      if (summarySnapshot.hasError) {
+                        return Center(child: Text('Error: ${summarySnapshot.error}'));
+                      }
+                      if (!summarySnapshot.hasData) {
+                        return const Center(
+                          child: CupertinoActivityIndicator(radius: 14),
+                        );
+                      }
+
+                      final summaries = summarySnapshot.data!;
+                      final nearbyTiles = _buildNearbyChatTiles();
+                      return ListView(
+                        children: [
+                          ...nearbyTiles,
+                          ...summaries.map(_buildConversationTile),
+                        ],
+                      );
+                    },
                   );
-                }
-
-                final summaries = summarySnapshot.data!;
-                final nearbyTiles = _buildNearbyChatTiles();
-                return ListView(
-                  children: [
-                    ...nearbyTiles,
-                    ...summaries.map(_buildConversationTile),
-                  ],
-                );
-              },
-            );
-          },
+                },
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -2319,15 +2367,24 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       padding: EdgeInsets.zero,
       onPressed: () async {
         await _markNearbyChatRead(device.deviceId.trim());
+        final pendingWalkie = _consumePendingWalkieInviteForDevice(
+          device.deviceId,
+        );
+        final pendingInviteId = pendingWalkie?['inviteId']?.trim() ?? '';
+        final pendingPeerName = pendingWalkie?['peerName']?.trim() ?? '';
         if (!mounted) return;
         await Navigator.of(context).push(
           CupertinoPageRoute<void>(
             builder: (_) => BluetoothConversationScreen(
               service: _bluetoothService,
               deviceId: device.deviceId,
-              peerName: peerLabel,
+              peerName: pendingPeerName.isNotEmpty ? pendingPeerName : peerLabel,
               peerAvatarBase64: meta?.peerAvatarBase64,
               peerAvatarHash: meta?.peerAvatarHash,
+              initialWalkieInviteId: pendingInviteId.isEmpty
+                  ? null
+                  : pendingInviteId,
+              initialWalkieSenderDeviceId: pendingWalkie?['deviceId']?.trim(),
             ),
           ),
         );
@@ -4078,6 +4135,8 @@ class BluetoothConversationScreen extends StatefulWidget {
     this.peerAvatarHash,
     this.autoOpenVoiceCall = false,
     this.autoOpenVoiceCallAsInitiator = false,
+    this.initialWalkieInviteId,
+    this.initialWalkieSenderDeviceId,
   });
 
   final BluetoothNearbyService service;
@@ -4087,6 +4146,8 @@ class BluetoothConversationScreen extends StatefulWidget {
   final String? peerAvatarHash;
   final bool autoOpenVoiceCall;
   final bool autoOpenVoiceCallAsInitiator;
+  final String? initialWalkieInviteId;
+  final String? initialWalkieSenderDeviceId;
 
   @override
   State<BluetoothConversationScreen> createState() =>
@@ -4293,6 +4354,16 @@ class _BluetoothConversationScreenState
   @override
   void initState() {
     super.initState();
+    final initialWalkieInviteId = widget.initialWalkieInviteId?.trim() ?? '';
+    if (initialWalkieInviteId.isNotEmpty) {
+      _showWalkieInvite = true;
+      _peerInBluetoothCall = true;
+      _incomingWalkieInviteId = initialWalkieInviteId;
+      _incomingWalkieSenderDeviceId =
+          widget.initialWalkieSenderDeviceId?.trim().isNotEmpty == true
+          ? widget.initialWalkieSenderDeviceId!.trim()
+          : widget.deviceId.trim();
+    }
     _peerAvatarBase64 = widget.peerAvatarBase64;
     _peerAvatarHash = widget.peerAvatarHash;
     WidgetsBinding.instance.addObserver(this);
@@ -6562,7 +6633,7 @@ class BluetoothVoiceCallScreen extends StatefulWidget {
 }
 
 class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
-  static const int _callChunkMs = 420;
+  static const int _callChunkMs = 900;
   static const int _minBufferedChunksToStart = 1;
   final _recorder = AudioRecorder();
   final _player = AudioPlayer();
@@ -6893,6 +6964,11 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
 
 class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
   static const bool _debugWalkieOverlay = true;
+  static const Duration _walkieHandshakeRetryInterval = Duration(
+    milliseconds: 900,
+  );
+  static const int _walkieInitiatorMaxRetries = 70;
+  static const int _walkieJoinerMaxRetries = 45;
   final _audioRecorder = AudioRecorder();
   final _audioPlayer = AudioPlayer();
   StreamSubscription<BluetoothIncomingMessage>? _incomingSub;
@@ -6922,6 +6998,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
   void initState() {
     super.initState();
     _activeInviteId = widget.inviteId?.trim() ?? '';
+    _lockedPeerDeviceId = widget.deviceId.trim();
     _peerReadyForPtt = widget.isJoiner;
     _liveNearbyDevices = widget.service.currentDevices;
     _devicesSub = widget.service.devicesStream.listen((devices) {
@@ -7045,8 +7122,17 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
   void _sendTextToPeerCandidates(String payload) {
     final targets = _candidateTargetDeviceIds();
     for (final target in targets) {
-      widget.service.sendText(target, payload);
+      unawaited(_inviteAndSend(target, payload));
     }
+  }
+
+  Future<void> _inviteAndSend(String target, String payload) async {
+    try {
+      await widget.service.invite(target, deviceName: widget.peerName);
+    } catch (_) {}
+    try {
+      await widget.service.sendText(target, payload);
+    } catch (_) {}
   }
 
   List<String> _candidateTargetDeviceIds() {
@@ -7091,7 +7177,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
   void _startJoinerRetryHandshake() {
     _joinerAcceptRetryTimer?.cancel();
     _joinerAcceptRetries = 0;
-    _joinerAcceptRetryTimer = Timer.periodic(const Duration(milliseconds: 900), (
+    _joinerAcceptRetryTimer = Timer.periodic(_walkieHandshakeRetryInterval, (
       timer,
     ) {
       if (!mounted || _peerReadyForPtt) {
@@ -7099,7 +7185,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
         _joinerAcceptRetryTimer = null;
         return;
       }
-      if (_joinerAcceptRetries >= 14) {
+      if (_joinerAcceptRetries >= _walkieJoinerMaxRetries) {
         timer.cancel();
         _joinerAcceptRetryTimer = null;
         return;
@@ -7112,7 +7198,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
   void _startInitiatorRetryHandshake() {
     _initiatorStartRetryTimer?.cancel();
     _initiatorStartRetries = 0;
-    _initiatorStartRetryTimer = Timer.periodic(const Duration(milliseconds: 900), (
+    _initiatorStartRetryTimer = Timer.periodic(_walkieHandshakeRetryInterval, (
       timer,
     ) {
       if (!mounted || _peerReadyForPtt) {
@@ -7120,7 +7206,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
         _initiatorStartRetryTimer = null;
         return;
       }
-      if (_initiatorStartRetries >= 14) {
+      if (_initiatorStartRetries >= _walkieInitiatorMaxRetries) {
         timer.cancel();
         _initiatorStartRetryTimer = null;
         return;
