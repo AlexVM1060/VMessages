@@ -19,11 +19,15 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 const _supabaseUrl = 'https://jziefknvztxxllogiwba.supabase.co';
 const _supabaseAnonKey =
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp6aWVma252enR4eGxsb2dpd2JhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2MjI1MzUsImV4cCI6MjA4NTE5ODUzNX0.uQzvXMfLT4spxhTjerxdarcMR8-f5l2KDpby-9Q1bAg';
+const _darkModePrefsKey = 'app_dark_mode_v1';
+final ValueNotifier<bool> _darkModeNotifier = ValueNotifier<bool>(false);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Supabase.initialize(url: _supabaseUrl, anonKey: _supabaseAnonKey);
   await _initLocalNotifications();
+  final prefs = await SharedPreferences.getInstance();
+  _darkModeNotifier.value = prefs.getBool(_darkModePrefsKey) ?? false;
   runApp(const VMessagesApp());
 }
 
@@ -43,17 +47,30 @@ class VMessagesApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const CupertinoApp(
-      debugShowCheckedModeBanner: false,
-      title: 'VMessages',
-      theme: CupertinoThemeData(
-        brightness: Brightness.light,
-        primaryColor: CupertinoColors.systemBlue,
-        scaffoldBackgroundColor: CupertinoColors.systemGroupedBackground,
-      ),
-      home: RootSessionGate(),
+    return ValueListenableBuilder<bool>(
+      valueListenable: _darkModeNotifier,
+      builder: (context, darkMode, _) {
+        return CupertinoApp(
+          debugShowCheckedModeBanner: false,
+          title: 'VMessages',
+          theme: CupertinoThemeData(
+            brightness: darkMode ? Brightness.dark : Brightness.light,
+            primaryColor: CupertinoColors.systemBlue,
+            scaffoldBackgroundColor: darkMode
+                ? const Color(0xFF000000)
+                : CupertinoColors.systemGroupedBackground,
+          ),
+          home: const RootSessionGate(),
+        );
+      },
     );
   }
+}
+
+Future<void> _setDarkMode(bool value) async {
+  _darkModeNotifier.value = value;
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_darkModePrefsKey, value);
 }
 
 class RootSessionGate extends StatelessWidget {
@@ -611,6 +628,13 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         if (_handleIncomingBtPresence(deviceId: resolvedId, body: body)) {
           return;
         }
+        if (body.startsWith('btctl::')) {
+          await _appendNearbyIncomingToHistory(deviceId: resolvedId, body: body);
+          return;
+        }
+        if (body.startsWith('btack::') || body.startsWith('btseen::')) {
+          return;
+        }
         if (_isBluetoothControlPayload(body)) return;
         await _appendNearbyIncomingToHistory(deviceId: resolvedId, body: body);
         await _showBluetoothMessageNotificationIfNeeded(
@@ -618,8 +642,9 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           body: body,
           rawIncoming: incoming.message,
         );
+        final lastPreview = _notificationPreviewFromBluetoothBody(body);
         final updated = NearbyChatMeta(
-          lastMessage: body.startsWith('btphoto::') ? '📷 Foto' : body,
+          lastMessage: lastPreview,
           lastMessageAt: DateTime.now(),
           hasUnread: true,
           peerPresence:
@@ -1750,7 +1775,13 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     required String deviceId,
     required String body,
   }) async {
-    if (_isBluetoothControlPayload(body)) return;
+    if (body.startsWith('btcall::') ||
+        body.startsWith('btcallvoice::') ||
+        body.startsWith('btvoicecall::') ||
+        body.startsWith('btack::') ||
+        body.startsWith('btseen::')) {
+      return;
+    }
     final prefs = await SharedPreferences.getInstance();
     final key = _btHistoryKey(deviceId);
     final raw = prefs.getString(key);
@@ -1795,7 +1826,8 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       try {
         final payload = body.replaceFirst('btctl::', '');
         final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
-        if (map['action']?.toString() == 'delete') {
+        final action = map['action']?.toString() ?? '';
+        if (action == 'delete') {
           final messageId = map['messageId']?.toString() ?? '';
           if (messageId.isNotEmpty) {
             list.removeWhere((item) {
@@ -1804,6 +1836,21 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
               return row['messageId']?.toString() == messageId;
             });
             await prefs.setString(key, jsonEncode(list));
+          }
+        } else if (action == 'reaction') {
+          final messageId = map['messageId']?.toString().trim() ?? '';
+          if (messageId.isNotEmpty) {
+            final reaction = map['reaction']?.toString().trim() ?? '';
+            for (var i = 0; i < list.length; i++) {
+              final item = list[i];
+              if (item is! Map) continue;
+              final row = Map<String, dynamic>.from(item);
+              if (row['messageId']?.toString() != messageId) continue;
+              row['reaction'] = reaction.isEmpty ? null : reaction;
+              list[i] = row;
+              await prefs.setString(key, jsonEncode(list));
+              break;
+            }
           }
         }
       } catch (_) {}
@@ -1824,6 +1871,8 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         if (type == 'photo') {
           final photoBytes = map['bytes']?.toString();
           final caption = map['caption']?.toString();
+          final replyToMessageId = map['replyToMessageId']?.toString();
+          final replyToPreview = map['replyToPreview']?.toString();
           list.add({
             'messageId': messageId,
             'text': '',
@@ -1833,12 +1882,16 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
             'audioBytes': null,
             'audioDurationMs': null,
             'caption': caption,
+            'replyToMessageId': replyToMessageId,
+            'replyToPreview': replyToPreview,
           });
         } else if (type == 'voice') {
           final audioBytes = map['bytes']?.toString();
           final audioDurationMs = int.tryParse(
             map['durationMs']?.toString() ?? '',
           );
+          final replyToMessageId = map['replyToMessageId']?.toString();
+          final replyToPreview = map['replyToPreview']?.toString();
           list.add({
             'messageId': messageId,
             'text': '',
@@ -1848,10 +1901,14 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
             'audioBytes': audioBytes,
             'audioDurationMs': audioDurationMs,
             'caption': null,
+            'replyToMessageId': replyToMessageId,
+            'replyToPreview': replyToPreview,
           });
         } else {
           final text = map['text']?.toString() ?? '';
           if (text.trim().isEmpty) return;
+          final replyToMessageId = map['replyToMessageId']?.toString();
+          final replyToPreview = map['replyToPreview']?.toString();
           list.add({
             'messageId': messageId,
             'text': text.trim(),
@@ -1861,6 +1918,8 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
             'audioBytes': null,
             'audioDurationMs': null,
             'caption': null,
+            'replyToMessageId': replyToMessageId,
+            'replyToPreview': replyToPreview,
           });
         }
       } catch (_) {}
@@ -2048,30 +2107,41 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
       navigationBar: CupertinoNavigationBar(
+        leading: CupertinoButton(
+          padding: EdgeInsets.zero,
+          onPressed: () async {
+            await Navigator.of(context).push(
+              CupertinoPageRoute<void>(
+                builder: (_) => const ProfileScreen(),
+              ),
+            );
+            await _loadMyBluetoothAvatarCache();
+            await _broadcastBluetoothPresence();
+          },
+          child: const Icon(CupertinoIcons.person_circle, size: 24),
+        ),
         middle: const Text('Mensajes'),
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             CupertinoButton(
               padding: EdgeInsets.zero,
-              onPressed: _creatingChat ? null : _startNewChat,
-              child: _creatingChat
-                  ? const CupertinoActivityIndicator(radius: 10)
-                  : const Icon(CupertinoIcons.square_pencil, size: 24),
+              onPressed: () {
+                Navigator.of(context).push(
+                  CupertinoPageRoute<void>(
+                    builder: (_) => const SettingsScreen(),
+                  ),
+                );
+              },
+              child: const Icon(CupertinoIcons.settings, size: 24),
             ),
             const SizedBox(width: 10),
             CupertinoButton(
               padding: EdgeInsets.zero,
-              onPressed: () async {
-                await Navigator.of(context).push(
-                  CupertinoPageRoute<void>(
-                    builder: (_) => const ProfileScreen(),
-                  ),
-                );
-                await _loadMyBluetoothAvatarCache();
-                await _broadcastBluetoothPresence();
-              },
-              child: const Icon(CupertinoIcons.person_circle, size: 24),
+              onPressed: _creatingChat ? null : _startNewChat,
+              child: _creatingChat
+                  ? const CupertinoActivityIndicator(radius: 10)
+                  : const Icon(CupertinoIcons.square_pencil, size: 24),
             ),
             const SizedBox(width: 10),
             CupertinoButton(
@@ -2139,8 +2209,16 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     }
     return ListView(
       children: [
-        const Center(
-          child: Text('Sin chats aun. Toca el icono para iniciar uno.'),
+        Center(
+          child: Text(
+            'Sin chats aun. Toca el icono para iniciar uno.',
+            style: TextStyle(
+              color: CupertinoDynamicColor.resolve(
+                CupertinoColors.secondaryLabel,
+                context,
+              ),
+            ),
+          ),
         ),
       ],
     );
@@ -2240,9 +2318,12 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                 children: [
                   Text(
                     peerLabel,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 16,
-                      color: CupertinoColors.black,
+                      color: CupertinoDynamicColor.resolve(
+                        CupertinoColors.label,
+                        context,
+                      ),
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -2273,8 +2354,11 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                     subtitle,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: CupertinoColors.systemGrey,
+                    style: TextStyle(
+                      color: CupertinoDynamicColor.resolve(
+                        CupertinoColors.secondaryLabel,
+                        context,
+                      ),
                       fontSize: 14,
                     ),
                   ),
@@ -2287,8 +2371,11 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
               children: [
                 Text(
                   time,
-                  style: const TextStyle(
-                    color: CupertinoColors.systemGrey2,
+                  style: TextStyle(
+                    color: CupertinoDynamicColor.resolve(
+                      CupertinoColors.tertiaryLabel,
+                      context,
+                    ),
                     fontSize: 12,
                   ),
                 ),
@@ -2378,9 +2465,12 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                 children: [
                   Text(
                     summary.peerDisplayName,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 16,
-                      color: CupertinoColors.black,
+                      color: CupertinoDynamicColor.resolve(
+                        CupertinoColors.label,
+                        context,
+                      ),
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -2389,8 +2479,11 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                     summary.lastMessage,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: CupertinoColors.systemGrey,
+                    style: TextStyle(
+                      color: CupertinoDynamicColor.resolve(
+                        CupertinoColors.secondaryLabel,
+                        context,
+                      ),
                       fontSize: 14,
                     ),
                   ),
@@ -2405,8 +2498,11 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                   summary.lastMessageAt == null
                       ? ''
                       : _formatTime(summary.lastMessageAt!),
-                  style: const TextStyle(
-                    color: CupertinoColors.systemGrey2,
+                  style: TextStyle(
+                    color: CupertinoDynamicColor.resolve(
+                      CupertinoColors.tertiaryLabel,
+                      context,
+                    ),
                     fontSize: 12,
                   ),
                 ),
@@ -2643,6 +2739,58 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   : const Text('Guardar codigo'),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class SettingsScreen extends StatelessWidget {
+  const SettingsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoPageScaffold(
+      navigationBar: const CupertinoNavigationBar(middle: Text('Configuracion')),
+      child: SafeArea(
+        child: ValueListenableBuilder<bool>(
+          valueListenable: _darkModeNotifier,
+          builder: (context, darkMode, _) {
+            return ListView(
+              children: [
+                Container(
+                  margin: const EdgeInsets.fromLTRB(12, 14, 12, 0),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 10,
+                  ),
+                  decoration: BoxDecoration(
+                    color: CupertinoDynamicColor.resolve(
+                      CupertinoColors.secondarySystemGroupedBackground,
+                      context,
+                    ),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          'Modo oscuro',
+                          style: TextStyle(fontSize: 16),
+                        ),
+                      ),
+                      CupertinoSwitch(
+                        value: darkMode,
+                        onChanged: (value) {
+                          _setDarkMode(value);
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
@@ -3537,14 +3685,23 @@ class _AttachTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = CupertinoTheme.of(context).brightness == Brightness.dark;
+    final tileBg = isDark ? const Color(0xFF2C2C2E) : const Color(0xFFE9E9EE);
+    final tileText = isDark
+        ? CupertinoColors.white
+        : const Color(0xFF1C1C1E);
+    final tileBorder = isDark
+        ? const Color(0xFF3A3A3C)
+        : const Color(0xFFD8D8DD);
     return CupertinoButton(
       padding: EdgeInsets.zero,
       onPressed: onTap,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
         decoration: BoxDecoration(
-          color: const Color(0xFFE9E9EE),
+          color: tileBg,
           borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: tileBorder, width: 0.6),
         ),
         child: Row(
           children: [
@@ -3552,8 +3709,8 @@ class _AttachTile extends StatelessWidget {
             const SizedBox(width: 6),
             Text(
               title,
-              style: const TextStyle(
-                color: Color(0xFF1C1C1E),
+              style: TextStyle(
+                color: tileText,
                 fontWeight: FontWeight.w600,
                 fontSize: 13,
               ),
@@ -3907,6 +4064,7 @@ class BluetoothConversationScreen extends StatefulWidget {
 class _BluetoothConversationScreenState
     extends State<BluetoothConversationScreen>
     with WidgetsBindingObserver {
+  static const List<String> _quickReactions = ['❤️', '😂', '😮', '🔥', '👍', '👎'];
   final _controller = TextEditingController();
   final _focusNode = FocusNode();
   final _scrollController = ScrollController();
@@ -3950,6 +4108,10 @@ class _BluetoothConversationScreenState
   final List<String> _recentWalkieAudioSignatures = [];
   bool _playingIncomingCallAudio = false;
   bool _loadingHistory = true;
+  bool _plusButtonPressed = false;
+  bool _stopButtonPressed = false;
+  String? _replyToMessageId;
+  String? _replyToPreview;
   Timer? _resumeRelinkTimer;
   int _resumeRelinkAttempts = 0;
   AppLifecycleState _screenLifecycleState = AppLifecycleState.resumed;
@@ -4314,8 +4476,10 @@ class _BluetoothConversationScreenState
         await _sendVoiceNote();
       } else {
         final id = _newBtMessageId();
+        final replyToId = _replyToMessageId;
+        final replyToPreview = _replyToPreview;
         await _sendTextSmart(
-          'btmsg::${jsonEncode({'id': id, 'type': 'text', 'text': text})}',
+          'btmsg::${jsonEncode({'id': id, 'type': 'text', 'text': text, 'replyToMessageId': replyToId, 'replyToPreview': replyToPreview})}',
         );
         if (!mounted) return;
         setState(() {
@@ -4331,15 +4495,20 @@ class _BluetoothConversationScreenState
               audioBytes: null,
               audioDurationMs: null,
               caption: null,
+              replyToMessageId: replyToId,
+              replyToPreview: replyToPreview,
             ),
           );
         });
+        await _updateNearbyListLastMessage(text.trim());
       }
       if (!mounted) return;
       setState(() {
         _pendingPhoto = null;
         _pendingVoiceBytes = null;
         _pendingVoiceDurationMs = null;
+        _replyToMessageId = null;
+        _replyToPreview = null;
       });
       _saveLocalHistory();
       _controller.clear();
@@ -4359,11 +4528,15 @@ class _BluetoothConversationScreenState
     if (photo == null) return;
     final bytes = await photo.readAsBytes();
     final id = _newBtMessageId();
+    final replyToId = _replyToMessageId;
+    final replyToPreview = _replyToPreview;
     final payload = jsonEncode({
       'id': id,
       'type': 'photo',
       'bytes': base64Encode(bytes),
       'caption': caption,
+      'replyToMessageId': replyToId,
+      'replyToPreview': replyToPreview,
     });
     await _sendTextSmart('btmsg::$payload');
     if (!mounted) return;
@@ -4380,21 +4553,30 @@ class _BluetoothConversationScreenState
           audioBytes: null,
           audioDurationMs: null,
           caption: caption.trim().isEmpty ? null : caption.trim(),
+          replyToMessageId: replyToId,
+          replyToPreview: replyToPreview,
         ),
       );
     });
     _saveLocalHistory();
+    await _updateNearbyListLastMessage(
+      caption.trim().isEmpty ? '📷 Foto' : '📷 ${caption.trim()}',
+    );
   }
 
   Future<void> _sendVoiceNote() async {
     final voice = _pendingVoiceBytes;
     if (voice == null) return;
     final id = _newBtMessageId();
+    final replyToId = _replyToMessageId;
+    final replyToPreview = _replyToPreview;
     final payload = jsonEncode({
       'id': id,
       'type': 'voice',
       'bytes': base64Encode(voice),
       'durationMs': _pendingVoiceDurationMs ?? 0,
+      'replyToMessageId': replyToId,
+      'replyToPreview': replyToPreview,
     });
     await _sendTextSmart('btmsg::$payload');
     if (!mounted) return;
@@ -4411,10 +4593,37 @@ class _BluetoothConversationScreenState
           audioBytes: voice,
           audioDurationMs: _pendingVoiceDurationMs,
           caption: null,
+          replyToMessageId: replyToId,
+          replyToPreview: replyToPreview,
         ),
       );
     });
     _saveLocalHistory();
+    await _updateNearbyListLastMessage('🎤 Audio');
+  }
+
+  Future<void> _updateNearbyListLastMessage(String preview) async {
+    try {
+      final cleanPreview = preview.trim().isEmpty ? 'Nuevo mensaje' : preview.trim();
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('bt_chat_meta') ?? '{}';
+      final decoded = jsonDecode(raw);
+      final map = decoded is Map
+          ? Map<String, dynamic>.from(decoded)
+          : <String, dynamic>{};
+      final key = widget.deviceId.trim();
+      final current = NearbyChatMeta.fromJson(map[key]);
+      map[key] = NearbyChatMeta(
+        lastMessage: cleanPreview,
+        lastMessageAt: DateTime.now(),
+        hasUnread: false,
+        peerPresence: current?.peerPresence ?? 'online',
+        peerPresenceAt: current?.peerPresenceAt,
+        peerAvatarBase64: current?.peerAvatarBase64,
+        peerAvatarHash: current?.peerAvatarHash,
+      ).toJson();
+      await prefs.setString('bt_chat_meta', jsonEncode(map));
+    } catch (_) {}
   }
 
   Future<void> _toggleVoiceRecording() async {
@@ -4506,6 +4715,65 @@ class _BluetoothConversationScreenState
     _recordingTicker = null;
     await _amplitudeSub?.cancel();
     _amplitudeSub = null;
+  }
+
+  Future<void> _togglePendingVoicePreview() async {
+    final voice = _pendingVoiceBytes;
+    if (voice == null || voice.isEmpty) return;
+    const draftId = 'draft_voice_preview';
+    if (_playingMessageId == draftId) {
+      await _audioPlayer.stop();
+      if (!mounted) return;
+      setState(() {
+        _playingMessageId = null;
+      });
+      return;
+    }
+    final dir = await _runtimeTempDir();
+    final path = '${dir.path}/$draftId.m4a';
+    final file = File(path);
+    await file.parent.create(recursive: true);
+    await file.writeAsBytes(voice, flush: true);
+    await _audioPlayer.stop();
+    await _audioPlayer.play(DeviceFileSource(path));
+    if (!mounted) return;
+    setState(() {
+      _playingMessageId = draftId;
+    });
+  }
+
+  Future<void> _pulsePlusButton() async {
+    if (!mounted) return;
+    setState(() {
+      _plusButtonPressed = true;
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 110));
+    if (!mounted) return;
+    setState(() {
+      _plusButtonPressed = false;
+    });
+  }
+
+  Future<void> _pulseStopButton() async {
+    if (!mounted) return;
+    setState(() {
+      _stopButtonPressed = true;
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 120));
+    if (!mounted) return;
+    setState(() {
+      _stopButtonPressed = false;
+    });
+  }
+
+  Future<void> _onPrimaryActionPressed() async {
+    if (_sending) return;
+    if (_recordingVoice) {
+      await _pulseStopButton();
+      await _stopVoiceRecording();
+      return;
+    }
+    await _send();
   }
 
   Future<void> _playVoiceMessage(_BluetoothChatMessage message) async {
@@ -4651,6 +4919,16 @@ class _BluetoothConversationScreenState
         _setPeerTyping(isTyping);
         return true;
       }
+      if (action == 'reaction') {
+        final messageId = map['messageId']?.toString().trim() ?? '';
+        final reactionRaw = map['reaction']?.toString().trim() ?? '';
+        if (messageId.isEmpty) return true;
+        _applyReactionLocally(
+          messageId: messageId,
+          reaction: reactionRaw.isEmpty ? null : reactionRaw,
+        );
+        return true;
+      }
       if (action != 'delete') return true;
       final messageId = map['messageId']?.toString() ?? '';
       if (messageId.isEmpty) return true;
@@ -4670,6 +4948,31 @@ class _BluetoothConversationScreenState
     await _saveLocalHistory();
     await _sendTextSmart(
       'btctl::${jsonEncode({'action': 'delete', 'messageId': message.messageId})}',
+    );
+  }
+
+  void _applyReactionLocally({
+    required String messageId,
+    required String? reaction,
+  }) {
+    final targetIndex = _messages.indexWhere((m) => m.messageId == messageId);
+    if (targetIndex < 0) return;
+    setState(() {
+      _messages[targetIndex] = _messages[targetIndex].copyWith(
+        reaction: reaction,
+        clearReaction: reaction == null,
+      );
+    });
+    unawaited(_saveLocalHistory());
+  }
+
+  Future<void> _setMessageReaction(
+    _BluetoothChatMessage message,
+    String? reaction,
+  ) async {
+    _applyReactionLocally(messageId: message.messageId, reaction: reaction);
+    await _sendTextSmart(
+      'btctl::${jsonEncode({'action': 'reaction', 'messageId': message.messageId, 'reaction': reaction ?? ''})}',
     );
   }
 
@@ -4867,6 +5170,24 @@ class _BluetoothConversationScreenState
     return '$minutes:$seconds';
   }
 
+  String _messagePreview(_BluetoothChatMessage m) {
+    if (m.text.trim().isNotEmpty) return m.text.trim();
+    if ((m.caption ?? '').trim().isNotEmpty) return m.caption!.trim();
+    if (m.audioBytes != null) return 'Nota de voz';
+    if (m.photoBytes != null) return 'Foto';
+    return 'Mensaje';
+  }
+
+  String _resolveReplyPreview(_BluetoothChatMessage m) {
+    final direct = m.replyToPreview?.trim() ?? '';
+    if (direct.isNotEmpty) return direct;
+    final refId = m.replyToMessageId?.trim() ?? '';
+    if (refId.isEmpty) return '';
+    final idx = _messages.lastIndexWhere((x) => x.messageId == refId);
+    if (idx < 0) return '';
+    return _messagePreview(_messages[idx]);
+  }
+
   void _startRecordingUiTicker() {
     _recordingTicker?.cancel();
     _recordingTicker = Timer.periodic(const Duration(milliseconds: 120), (_) {
@@ -4995,6 +5316,8 @@ class _BluetoothConversationScreenState
             caption: map['caption']?.toString().trim().isEmpty == true
                 ? null
                 : map['caption']?.toString().trim(),
+            replyToMessageId: map['replyToMessageId']?.toString(),
+            replyToPreview: map['replyToPreview']?.toString(),
           );
         }
         if (type == 'voice') {
@@ -5013,6 +5336,8 @@ class _BluetoothConversationScreenState
             audioBytes: bytes,
             audioDurationMs: durationMs,
             caption: null,
+            replyToMessageId: map['replyToMessageId']?.toString(),
+            replyToPreview: map['replyToPreview']?.toString(),
           );
         }
         final text = map['text']?.toString() ?? '';
@@ -5028,6 +5353,8 @@ class _BluetoothConversationScreenState
           audioBytes: null,
           audioDurationMs: null,
           caption: null,
+          replyToMessageId: map['replyToMessageId']?.toString(),
+          replyToPreview: map['replyToPreview']?.toString(),
         );
       } catch (_) {
         return null;
@@ -5114,6 +5441,37 @@ class _BluetoothConversationScreenState
 
   @override
   Widget build(BuildContext context) {
+    final isDark = CupertinoTheme.of(context).brightness == Brightness.dark;
+    final incomingBubbleColor = isDark
+        ? const Color(0xFF2C2C2E)
+        : const Color(0xFFE5E5EA);
+    final incomingTextColor = isDark
+        ? CupertinoColors.white
+        : const Color(0xFF1C1C1E);
+    final reactionBgColor = isDark
+        ? const Color(0xFF2C2C2E)
+        : const Color(0xFFF2F2F7);
+    final reactionBorderColor = isDark
+        ? const Color(0xFF3A3A3C)
+        : const Color(0xFFD1D1D6);
+    final inviteCardBg = isDark
+        ? const Color(0xFF1E2D3A)
+        : const Color(0xFFEAF7FF);
+    final inviteTextColor = isDark
+        ? CupertinoColors.white
+        : const Color(0xFF1C1C1E);
+    final composerPanelColor = isDark
+        ? const Color(0xFF1C1C1E)
+        : const Color(0xFFF2F2F7);
+    final composerFieldColor = isDark
+        ? const Color(0xFF2C2C2E)
+        : const Color(0xFFF2F2F7);
+    final composerTextColor = isDark
+        ? CupertinoColors.white
+        : const Color(0xFF1C1C1E);
+    final composerPlaceholderColor = isDark
+        ? const Color(0xFF8E8E93)
+        : const Color(0xFF8E8E93);
     final keyboardVisible = MediaQuery.of(context).viewInsets.bottom > 0;
     if (keyboardVisible && !_wasKeyboardVisible) {
       _wasKeyboardVisible = true;
@@ -5176,21 +5534,23 @@ class _BluetoothConversationScreenState
           children: [
             CupertinoButton(
               padding: EdgeInsets.zero,
+              minimumSize: const Size(44, 44),
+              onPressed: () => _openWalkieTalkie(isInitiator: true),
+              child: const Icon(
+                CupertinoIcons.waveform_path,
+                color: CupertinoColors.systemBlue,
+                size: 24,
+              ),
+            ),
+            const SizedBox(width: 14),
+            CupertinoButton(
+              padding: EdgeInsets.zero,
               minimumSize: Size.zero,
               onPressed: () => _openVoiceCall(isInitiator: true),
               child: const Icon(
                 CupertinoIcons.phone_fill,
                 color: CupertinoColors.systemGreen,
-              ),
-            ),
-            const SizedBox(width: 10),
-            CupertinoButton(
-              padding: EdgeInsets.zero,
-              minimumSize: Size.zero,
-              onPressed: () => _openWalkieTalkie(isInitiator: true),
-              child: Icon(
-                CupertinoIcons.waveform_circle_fill,
-                color: CupertinoColors.systemBlue,
+                size: 30,
               ),
             ),
           ],
@@ -5214,7 +5574,7 @@ class _BluetoothConversationScreenState
                           vertical: 10,
                         ),
                         decoration: BoxDecoration(
-                          color: const Color(0xFFEAF7FF),
+                          color: inviteCardBg,
                           borderRadius: BorderRadius.circular(12),
                         ),
                         child: Row(
@@ -5228,9 +5588,9 @@ class _BluetoothConversationScreenState
                             Expanded(
                               child: Text(
                                 '${widget.peerName} te llama por Bluetooth',
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontSize: 13,
-                                  color: Color(0xFF1C1C1E),
+                                  color: inviteTextColor,
                                   fontWeight: FontWeight.w600,
                                 ),
                               ),
@@ -5250,7 +5610,7 @@ class _BluetoothConversationScreenState
                           vertical: 10,
                         ),
                         decoration: BoxDecoration(
-                          color: const Color(0xFFEAF7FF),
+                          color: inviteCardBg,
                           borderRadius: BorderRadius.circular(12),
                         ),
                         child: Row(
@@ -5264,9 +5624,9 @@ class _BluetoothConversationScreenState
                             Expanded(
                               child: Text(
                                 '${widget.peerName} quiere hablar contigo por walkie talkie',
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontSize: 13,
-                                  color: Color(0xFF1C1C1E),
+                                  color: inviteTextColor,
                                   fontWeight: FontWeight.w600,
                                 ),
                               ),
@@ -5311,7 +5671,7 @@ class _BluetoothConversationScreenState
                                         vertical: 8,
                                       ),
                                       decoration: BoxDecoration(
-                                        color: const Color(0xFFE5E5EA),
+                                        color: incomingBubbleColor,
                                         borderRadius: BorderRadius.circular(16),
                                       ),
                                       child: const _TypingDots(),
@@ -5324,7 +5684,41 @@ class _BluetoothConversationScreenState
                                   !_messages
                                       .skip(index + 1)
                                       .any((m) => m.isMe);
-                              return Row(
+                              final replyPreview = _resolveReplyPreview(message);
+                              return Dismissible(
+                                key: ValueKey('reply_${message.messageId}_$index'),
+                                direction: DismissDirection.startToEnd,
+                                dismissThresholds: const {
+                                  DismissDirection.startToEnd: 0.24,
+                                },
+                                confirmDismiss: (_) async {
+                                  if (!mounted) return false;
+                                  setState(() {
+                                    _replyToMessageId = message.messageId;
+                                    _replyToPreview = _messagePreview(message);
+                                  });
+                                  return false;
+                                },
+                                background: Container(
+                                  alignment: Alignment.centerLeft,
+                                  padding: const EdgeInsets.only(left: 16),
+                                  child: Container(
+                                    width: 34,
+                                    height: 34,
+                                    decoration: BoxDecoration(
+                                      color: CupertinoColors.systemBlue.withValues(
+                                        alpha: 0.16,
+                                      ),
+                                      shape: BoxShape.circle,
+                                    ),
+                                    child: const Icon(
+                                      CupertinoIcons.reply,
+                                      color: CupertinoColors.systemBlue,
+                                      size: 19,
+                                    ),
+                                  ),
+                                ),
+                                child: Row(
                                 mainAxisAlignment: message.isMe
                                     ? MainAxisAlignment.end
                                     : MainAxisAlignment.start,
@@ -5336,6 +5730,73 @@ class _BluetoothConversationScreenState
                                     children: [
                                       CupertinoContextMenu(
                                         actions: [
+                                          CupertinoContextMenuAction(
+                                            onPressed: () {},
+                                            child: Row(
+                                              mainAxisAlignment:
+                                                  MainAxisAlignment.spaceEvenly,
+                                              children: [
+                                                for (final emoji
+                                                    in _quickReactions)
+                                                  GestureDetector(
+                                                    behavior: HitTestBehavior.opaque,
+                                                    onTap: () async {
+                                                      Navigator.of(context).pop();
+                                                      await _setMessageReaction(
+                                                        message,
+                                                        emoji,
+                                                      );
+                                                    },
+                                                    child: Padding(
+                                                      padding:
+                                                          const EdgeInsets.symmetric(
+                                                            horizontal: 2,
+                                                          ),
+                                                      child: Text(
+                                                        emoji,
+                                                        style: const TextStyle(
+                                                          fontSize: 24,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                              ],
+                                            ),
+                                          ),
+                                          CupertinoContextMenuAction(
+                                            trailingIcon: CupertinoIcons.doc_on_doc,
+                                            onPressed: () async {
+                                              final navigator = Navigator.of(
+                                                context,
+                                              );
+                                              final copyText =
+                                                  message.text.trim().isNotEmpty
+                                                  ? message.text.trim()
+                                                  : ((message.caption ?? '')
+                                                        .trim()
+                                                        .isNotEmpty
+                                                    ? message.caption!.trim()
+                                                    : (message.audioBytes != null
+                                                          ? 'Nota de voz'
+                                                          : 'Mensaje'));
+                                              await Clipboard.setData(
+                                                ClipboardData(text: copyText),
+                                              );
+                                              if (!mounted) return;
+                                              navigator.pop();
+                                            },
+                                            child: const Text('Copiar'),
+                                          ),
+                                          CupertinoContextMenuAction(
+                                            onPressed: () async {
+                                              Navigator.of(context).pop();
+                                              await _setMessageReaction(
+                                                message,
+                                                null,
+                                              );
+                                            },
+                                            child: const Text('Quitar reaccion'),
+                                          ),
                                           CupertinoContextMenuAction(
                                             isDestructiveAction: true,
                                             trailingIcon: CupertinoIcons.delete,
@@ -5354,110 +5815,263 @@ class _BluetoothConversationScreenState
                                             ),
                                           ),
                                         ],
-                                        child: Container(
-                                          margin: const EdgeInsets.only(bottom: 4),
-                                          padding: const EdgeInsets.symmetric(
-                                            horizontal: 14,
-                                            vertical: 10,
-                                          ),
-                                          constraints: BoxConstraints(
-                                            maxWidth:
-                                                MediaQuery.of(context).size.width *
-                                                0.76,
-                                          ),
-                                          decoration: BoxDecoration(
-                                            color: message.isMe
-                                                ? const Color(0xFF0A84FF)
-                                                : const Color(0xFFE5E5EA),
-                                            borderRadius: BorderRadius.circular(20),
-                                          ),
-                                          child:
-                                              message.photoBytes == null &&
-                                                  message.audioBytes == null
-                                              ? Text(
-                                                  message.text,
-                                                  style: TextStyle(
-                                                    fontSize: 16,
-                                                    color: message.isMe
-                                                        ? CupertinoColors.white
-                                                        : const Color(0xFF1C1C1E),
-                                                  ),
-                                                )
-                                              : message.audioBytes != null
-                                              ? CupertinoButton(
-                                                  padding: EdgeInsets.zero,
-                                                  minimumSize: Size.zero,
-                                                  onPressed: () =>
-                                                      _playVoiceMessage(message),
-                                                  child: Row(
-                                                    mainAxisSize: MainAxisSize.min,
-                                                    children: [
-                                                      Icon(
-                                                        _playingMessageId ==
-                                                                '${message.sentAt.millisecondsSinceEpoch}_${message.isMe}'
-                                                            ? CupertinoIcons
-                                                                  .stop_fill
-                                                            : CupertinoIcons
-                                                                  .play_fill,
-                                                        color: message.isMe
-                                                            ? CupertinoColors.white
-                                                            : const Color(
-                                                                0xFF1C1C1E,
-                                                              ),
-                                                        size: 22,
-                                                      ),
-                                                      const SizedBox(width: 8),
-                                                      Text(
-                                                        _formatVoiceDuration(
-                                                          message.audioDurationMs,
-                                                        ),
-                                                        style: TextStyle(
-                                                          fontSize: 14,
-                                                          color: message.isMe
-                                                              ? CupertinoColors
-                                                                    .white
-                                                              : const Color(
-                                                                  0xFF1C1C1E,
-                                                                ),
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                )
-                                              : Column(
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
-                                                  mainAxisSize: MainAxisSize.min,
-                                                  children: [
-                                                    ClipRRect(
-                                                      borderRadius:
-                                                          BorderRadius.circular(14),
-                                                      child: Image.memory(
-                                                        message.photoBytes!,
-                                                        width: 220,
-                                                        height: 220,
-                                                        fit: BoxFit.cover,
-                                                      ),
-                                                    ),
-                                                    if ((message.caption ?? '')
-                                                        .trim()
-                                                        .isNotEmpty) ...[
-                                                      const SizedBox(height: 6),
-                                                      Text(
-                                                        message.caption!.trim(),
-                                                        style: TextStyle(
-                                                          fontSize: 14,
-                                                          color: message.isMe
-                                                              ? CupertinoColors
-                                                                    .white
-                                                              : const Color(
-                                                                  0xFF1C1C1E,
-                                                                ),
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ],
+                                        child: Stack(
+                                          clipBehavior: Clip.none,
+                                          children: [
+                                            Padding(
+                                              padding: const EdgeInsets.only(top: 8),
+                                              child: Container(
+                                                margin: const EdgeInsets.only(
+                                                  bottom: 4,
                                                 ),
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      horizontal: 14,
+                                                      vertical: 10,
+                                                    ),
+                                                constraints: BoxConstraints(
+                                                  maxWidth:
+                                                      MediaQuery.of(
+                                                        context,
+                                                      ).size.width *
+                                                      0.76,
+                                                ),
+                                                decoration: BoxDecoration(
+                                                  color: message.isMe
+                                                      ? const Color(0xFF0A84FF)
+                                                      : incomingBubbleColor,
+                                                  borderRadius:
+                                                      BorderRadius.circular(20),
+                                                ),
+                                                child:
+                                                    message.photoBytes == null &&
+                                                        message.audioBytes ==
+                                                            null
+                                                    ? Column(
+                                                        crossAxisAlignment:
+                                                            CrossAxisAlignment
+                                                                .start,
+                                                        mainAxisSize:
+                                                            MainAxisSize.min,
+                                                        children: [
+                                                          if (replyPreview
+                                                              .isNotEmpty) ...[
+                                                            Container(
+                                                              padding:
+                                                                  const EdgeInsets.symmetric(
+                                                                    horizontal: 8,
+                                                                    vertical: 5,
+                                                                  ),
+                                                              margin:
+                                                                  const EdgeInsets.only(
+                                                                    bottom: 6,
+                                                                  ),
+                                                              decoration: BoxDecoration(
+                                                                color: (message
+                                                                            .isMe
+                                                                        ? CupertinoColors
+                                                                            .white
+                                                                        : CupertinoColors
+                                                                            .black)
+                                                                    .withValues(
+                                                                  alpha: 0.12,
+                                                                ),
+                                                                borderRadius:
+                                                                    BorderRadius.circular(
+                                                                  8,
+                                                                ),
+                                                              ),
+                                                              child: Text(
+                                                                replyPreview,
+                                                                maxLines: 1,
+                                                                overflow:
+                                                                    TextOverflow
+                                                                        .ellipsis,
+                                                                style: TextStyle(
+                                                                  fontSize: 12,
+                                                                  color: message
+                                                                          .isMe
+                                                                      ? CupertinoColors
+                                                                            .white
+                                                                      : incomingTextColor,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ],
+                                                          Text(
+                                                            message.text,
+                                                            style: TextStyle(
+                                                              fontSize: 16,
+                                                              color: message.isMe
+                                                                  ? CupertinoColors
+                                                                        .white
+                                                                  : incomingTextColor,
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      )
+                                                    : message.audioBytes != null
+                                                    ? CupertinoButton(
+                                                        padding: EdgeInsets.zero,
+                                                        minimumSize: Size.zero,
+                                                        onPressed: () =>
+                                                            _playVoiceMessage(
+                                                              message,
+                                                            ),
+                                                        child: Row(
+                                                          mainAxisSize:
+                                                              MainAxisSize.min,
+                                                          children: [
+                                                            Icon(
+                                                              _playingMessageId ==
+                                                                      '${message.sentAt.millisecondsSinceEpoch}_${message.isMe}'
+                                                                  ? CupertinoIcons
+                                                                        .stop_fill
+                                                                  : CupertinoIcons
+                                                                        .play_fill,
+                                                              color: message.isMe
+                                                                  ? CupertinoColors
+                                                                        .white
+                                                                  : incomingTextColor,
+                                                              size: 22,
+                                                            ),
+                                                            const SizedBox(
+                                                              width: 8,
+                                                            ),
+                                                            Text(
+                                                              _formatVoiceDuration(
+                                                                message
+                                                                    .audioDurationMs,
+                                                              ),
+                                                              style: TextStyle(
+                                                                fontSize: 14,
+                                                                color: message.isMe
+                                                                    ? CupertinoColors
+                                                                          .white
+                                                                    : incomingTextColor,
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ),
+                                                      )
+                                                    : Column(
+                                                        crossAxisAlignment:
+                                                            CrossAxisAlignment
+                                                                .start,
+                                                        mainAxisSize:
+                                                            MainAxisSize.min,
+                                                        children: [
+                                                          if (replyPreview
+                                                              .isNotEmpty) ...[
+                                                            Container(
+                                                              padding:
+                                                                  const EdgeInsets.symmetric(
+                                                                    horizontal: 8,
+                                                                    vertical: 5,
+                                                                  ),
+                                                              margin:
+                                                                  const EdgeInsets.only(
+                                                                    bottom: 6,
+                                                                  ),
+                                                              decoration: BoxDecoration(
+                                                                color: (message
+                                                                            .isMe
+                                                                        ? CupertinoColors
+                                                                            .white
+                                                                        : CupertinoColors
+                                                                            .black)
+                                                                    .withValues(
+                                                                  alpha: 0.12,
+                                                                ),
+                                                                borderRadius:
+                                                                    BorderRadius.circular(
+                                                                  8,
+                                                                ),
+                                                              ),
+                                                              child: Text(
+                                                                replyPreview,
+                                                                maxLines: 1,
+                                                                overflow:
+                                                                    TextOverflow
+                                                                        .ellipsis,
+                                                                style: TextStyle(
+                                                                  fontSize: 12,
+                                                                  color: message
+                                                                          .isMe
+                                                                      ? CupertinoColors
+                                                                            .white
+                                                                      : incomingTextColor,
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ],
+                                                          ClipRRect(
+                                                            borderRadius:
+                                                                BorderRadius.circular(
+                                                                  14,
+                                                                ),
+                                                            child: Image.memory(
+                                                              message.photoBytes!,
+                                                              width: 220,
+                                                              height: 220,
+                                                              fit: BoxFit.cover,
+                                                            ),
+                                                          ),
+                                                          if ((message.caption ??
+                                                                  '')
+                                                              .trim()
+                                                              .isNotEmpty) ...[
+                                                            const SizedBox(
+                                                              height: 6,
+                                                            ),
+                                                            Text(
+                                                              message.caption!
+                                                                  .trim(),
+                                                              style: TextStyle(
+                                                                fontSize: 14,
+                                                                color: message.isMe
+                                                                    ? CupertinoColors
+                                                                          .white
+                                                                    : incomingTextColor,
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        ],
+                                                      ),
+                                              ),
+                                            ),
+                                            if ((message.reaction ?? '')
+                                                .trim()
+                                                .isNotEmpty)
+                                              Positioned(
+                                                top: -4,
+                                                left: message.isMe ? -14 : null,
+                                                right: message.isMe ? null : -14,
+                                                child: Container(
+                                                  padding:
+                                                      const EdgeInsets.symmetric(
+                                                        horizontal: 8,
+                                                        vertical: 3,
+                                                      ),
+                                                  decoration: BoxDecoration(
+                                                    color: reactionBgColor,
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          999,
+                                                        ),
+                                                    border: Border.all(
+                                                      color: reactionBorderColor,
+                                                    ),
+                                                  ),
+                                                  child: Text(
+                                                    message.reaction!.trim(),
+                                                    style: const TextStyle(
+                                                      fontSize: 14,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                          ],
                                         ),
                                       ),
                                       if (message.isMe && !message.isDelivered)
@@ -5493,6 +6107,7 @@ class _BluetoothConversationScreenState
                                     ],
                                   ),
                                 ],
+                              ),
                               );
                             },
                           ),
@@ -5523,7 +6138,7 @@ class _BluetoothConversationScreenState
                           vertical: 10,
                         ),
                         decoration: BoxDecoration(
-                          color: const Color(0xFFF2F2F7),
+                          color: composerPanelColor,
                           borderRadius: BorderRadius.circular(16),
                         ),
                         child: Row(
@@ -5539,10 +6154,10 @@ class _BluetoothConversationScreenState
                             const SizedBox(width: 8),
                             Text(
                               _formatVoiceDuration(_recordingElapsedMs),
-                              style: const TextStyle(
+                              style: TextStyle(
                                 fontFeatures: [FontFeature.tabularFigures()],
                                 fontWeight: FontWeight.w600,
-                                color: Color(0xFF1C1C1E),
+                                color: composerTextColor,
                               ),
                             ),
                             const SizedBox(width: 12),
@@ -5553,10 +6168,10 @@ class _BluetoothConversationScreenState
                               ),
                             ),
                             const SizedBox(width: 10),
-                            const Text(
+                            Text(
                               'Grabando...',
                               style: TextStyle(
-                                color: Color(0xFF1C1C1E),
+                                color: composerTextColor,
                                 fontWeight: FontWeight.w600,
                                 fontSize: 13,
                               ),
@@ -5569,7 +6184,7 @@ class _BluetoothConversationScreenState
                         margin: const EdgeInsets.fromLTRB(12, 10, 12, 0),
                         padding: const EdgeInsets.all(8),
                         decoration: BoxDecoration(
-                          color: const Color(0xFFF2F2F7),
+                          color: composerPanelColor,
                           borderRadius: BorderRadius.circular(14),
                         ),
                         child: Row(
@@ -5585,10 +6200,17 @@ class _BluetoothConversationScreenState
                                 ),
                               ),
                             if (_pendingVoiceBytes != null)
-                              const Icon(
-                                CupertinoIcons.waveform_circle_fill,
-                                size: 38,
-                                color: CupertinoColors.systemBlue,
+                              CupertinoButton(
+                                padding: EdgeInsets.zero,
+                                minimumSize: Size.zero,
+                                onPressed: _togglePendingVoicePreview,
+                                child: Icon(
+                                  _playingMessageId == 'draft_voice_preview'
+                                      ? CupertinoIcons.stop_circle_fill
+                                      : CupertinoIcons.play_circle_fill,
+                                  size: 38,
+                                  color: CupertinoColors.systemBlue,
+                                ),
                               ),
                             const SizedBox(width: 10),
                             Expanded(
@@ -5607,6 +6229,11 @@ class _BluetoothConversationScreenState
                                   ? null
                                   : () {
                                       setState(() {
+                                        if (_playingMessageId ==
+                                            'draft_voice_preview') {
+                                          _audioPlayer.stop();
+                                          _playingMessageId = null;
+                                        }
                                         _pendingPhoto = null;
                                         _pendingVoiceBytes = null;
                                         _pendingVoiceDurationMs = null;
@@ -5614,6 +6241,54 @@ class _BluetoothConversationScreenState
                                     },
                               child: const Icon(
                                 CupertinoIcons.xmark_circle_fill,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    if ((_replyToPreview ?? '').trim().isNotEmpty)
+                      Container(
+                        margin: const EdgeInsets.fromLTRB(12, 10, 12, 0),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: composerPanelColor,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              CupertinoIcons.reply,
+                              size: 16,
+                              color: CupertinoColors.systemBlue,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                _replyToPreview!.trim(),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: composerTextColor,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            CupertinoButton(
+                              padding: EdgeInsets.zero,
+                              minimumSize: Size.zero,
+                              onPressed: () {
+                                setState(() {
+                                  _replyToMessageId = null;
+                                  _replyToPreview = null;
+                                });
+                              },
+                              child: const Icon(
+                                CupertinoIcons.xmark_circle_fill,
+                                size: 18,
                               ),
                             ),
                           ],
@@ -5666,17 +6341,28 @@ class _BluetoothConversationScreenState
                         children: [
                           CupertinoButton(
                             padding: EdgeInsets.zero,
-                            onPressed: () {
+                            onPressed: () async {
+                              await _pulsePlusButton();
                               setState(() {
                                 _showAttachMenu = !_showAttachMenu;
                               });
                             },
-                            child: Icon(
-                              _showAttachMenu
-                                  ? CupertinoIcons.xmark_circle_fill
-                                  : CupertinoIcons.add_circled_solid,
-                              size: 30,
-                              color: CupertinoColors.systemBlue,
+                            child: AnimatedScale(
+                              duration: const Duration(milliseconds: 140),
+                              curve: Curves.easeOutBack,
+                              scale: _plusButtonPressed ? 0.86 : 1,
+                              child: AnimatedRotation(
+                                duration: const Duration(milliseconds: 180),
+                                curve: Curves.easeOutCubic,
+                                turns: _showAttachMenu ? 0.125 : 0,
+                                child: Icon(
+                                  _showAttachMenu
+                                      ? CupertinoIcons.xmark_circle_fill
+                                      : CupertinoIcons.add_circled_solid,
+                                  size: 30,
+                                  color: CupertinoColors.systemBlue,
+                                ),
+                              ),
                             ),
                           ),
                           const SizedBox(width: 8),
@@ -5686,7 +6372,7 @@ class _BluetoothConversationScreenState
                                 horizontal: 14,
                               ),
                               decoration: BoxDecoration(
-                                color: const Color(0xFFF2F2F7),
+                                color: composerFieldColor,
                                 borderRadius: BorderRadius.circular(22),
                               ),
                               child: CupertinoTextField(
@@ -5698,6 +6384,10 @@ class _BluetoothConversationScreenState
                                 textInputAction: TextInputAction.send,
                                 onSubmitted: (_) => _send(),
                                 placeholder: 'iMessage',
+                                style: TextStyle(color: composerTextColor),
+                                placeholderStyle: TextStyle(
+                                  color: composerPlaceholderColor,
+                                ),
                                 padding: const EdgeInsets.symmetric(
                                   vertical: 12,
                                 ),
@@ -5708,15 +6398,23 @@ class _BluetoothConversationScreenState
                           const SizedBox(width: 8),
                           CupertinoButton(
                             padding: EdgeInsets.zero,
-                            onPressed: _recordingVoice
-                                ? _stopVoiceRecording
-                                : (_sending ? null : _send),
-                            child: _sending
-                                ? const CupertinoActivityIndicator(radius: 12)
-                                : const Icon(
-                                    CupertinoIcons.arrow_up_circle_fill,
-                                    size: 34,
-                                  ),
+                            onPressed: _onPrimaryActionPressed,
+                            child: AnimatedScale(
+                              duration: const Duration(milliseconds: 140),
+                              curve: Curves.easeOutBack,
+                              scale: _stopButtonPressed ? 0.84 : 1,
+                              child: _sending
+                                  ? const CupertinoActivityIndicator(radius: 12)
+                                  : Icon(
+                                      _recordingVoice
+                                          ? CupertinoIcons.stop_circle_fill
+                                          : CupertinoIcons.arrow_up_circle_fill,
+                                      color: _recordingVoice
+                                          ? CupertinoColors.systemRed
+                                          : CupertinoColors.systemBlue,
+                                      size: _recordingVoice ? 36 : 34,
+                                    ),
+                            ),
                           ),
                         ],
                       ),
@@ -6073,6 +6771,13 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = CupertinoTheme.of(context).brightness == Brightness.dark;
+    final primaryTextColor = isDark
+        ? CupertinoColors.white
+        : const Color(0xFF1C1C1E);
+    final secondaryTextColor = isDark
+        ? const Color(0xFFAEAEB2)
+        : const Color(0xFF636366);
     return CupertinoPageScaffold(
       navigationBar: CupertinoNavigationBar(
         middle: Text('Llamada Bluetooth · ${widget.peerName}'),
@@ -6087,14 +6792,14 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
                         ? 'Conectado por Bluetooth'
                         : 'Esperando que respondan...')
                   : 'Llamada finalizada',
-              style: const TextStyle(fontSize: 16, color: Color(0xFF1C1C1E)),
+              style: TextStyle(fontSize: 16, color: primaryTextColor),
             ),
             const SizedBox(height: 6),
             Text(
               _fmt(_elapsedMs),
-              style: const TextStyle(
+              style: TextStyle(
                 fontFeatures: [FontFeature.tabularFigures()],
-                color: Color(0xFF636366),
+                color: secondaryTextColor,
               ),
             ),
             const Spacer(),
@@ -6513,6 +7218,17 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = CupertinoTheme.of(context).brightness == Brightness.dark;
+    final primaryTextColor = isDark
+        ? CupertinoColors.white
+        : const Color(0xFF1C1C1E);
+    final secondaryTextColor = isDark
+        ? const Color(0xFFAEAEB2)
+        : const Color(0xFF636366);
+    final debugTextColor = isDark
+        ? const Color(0xFFE5E5EA)
+        : const Color(0xFF1C1C1E);
+    final debugBg = isDark ? const Color(0x22FF9500) : const Color(0x11FF9500);
     return CupertinoPageScaffold(
       navigationBar: CupertinoNavigationBar(
         previousPageTitle: 'Chat',
@@ -6528,7 +7244,7 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
                   : (_peerReadyForPtt
                         ? 'Mantén presionado para hablar'
                         : 'Esperando a que ${widget.peerName} entre al Walkie Talkie...'),
-              style: const TextStyle(fontSize: 15, color: Color(0xFF636366)),
+              style: TextStyle(fontSize: 15, color: secondaryTextColor),
             ),
             const SizedBox(height: 14),
             Padding(
@@ -6541,10 +7257,10 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
             const SizedBox(height: 10),
             Text(
               _fmt(_elapsedMs),
-              style: const TextStyle(
+              style: TextStyle(
                 fontFeatures: [FontFeature.tabularFigures()],
                 fontWeight: FontWeight.w600,
-                color: Color(0xFF1C1C1E),
+                color: primaryTextColor,
               ),
             ),
             const Spacer(),
@@ -6591,15 +7307,15 @@ class _WalkieTalkieScreenState extends State<WalkieTalkieScreen> {
                 margin: const EdgeInsets.fromLTRB(12, 0, 12, 12),
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
-                  color: const Color(0x11FF9500),
+                  color: debugBg,
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(color: const Color(0x44FF9500)),
                 ),
                 child: Text(
                   _debugPeerSummary(),
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 11,
-                    color: Color(0xFF1C1C1E),
+                    color: debugTextColor,
                     fontFeatures: [FontFeature.tabularFigures()],
                   ),
                 ),
@@ -6623,6 +7339,9 @@ class _BluetoothChatMessage {
     required this.audioBytes,
     required this.audioDurationMs,
     required this.caption,
+    this.reaction,
+    this.replyToMessageId,
+    this.replyToPreview,
   });
 
   final String messageId;
@@ -6635,6 +7354,9 @@ class _BluetoothChatMessage {
   final Uint8List? audioBytes;
   final int? audioDurationMs;
   final String? caption;
+  final String? reaction;
+  final String? replyToMessageId;
+  final String? replyToPreview;
 
   _BluetoothChatMessage copyWith({
     String? messageId,
@@ -6647,6 +7369,10 @@ class _BluetoothChatMessage {
     Uint8List? audioBytes,
     int? audioDurationMs,
     String? caption,
+    String? reaction,
+    String? replyToMessageId,
+    String? replyToPreview,
+    bool clearReaction = false,
   }) {
     return _BluetoothChatMessage(
       messageId: messageId ?? this.messageId,
@@ -6659,6 +7385,9 @@ class _BluetoothChatMessage {
       audioBytes: audioBytes ?? this.audioBytes,
       audioDurationMs: audioDurationMs ?? this.audioDurationMs,
       caption: caption ?? this.caption,
+      reaction: clearReaction ? null : (reaction ?? this.reaction),
+      replyToMessageId: replyToMessageId ?? this.replyToMessageId,
+      replyToPreview: replyToPreview ?? this.replyToPreview,
     );
   }
 
@@ -6674,6 +7403,9 @@ class _BluetoothChatMessage {
       'audioBytes': audioBytes == null ? null : base64Encode(audioBytes!),
       'audioDurationMs': audioDurationMs,
       'caption': caption,
+      'reaction': reaction,
+      'replyToMessageId': replyToMessageId,
+      'replyToPreview': replyToPreview,
     };
   }
 
@@ -6717,6 +7449,11 @@ class _BluetoothChatMessage {
           ? map['audioDurationMs'] as int
           : int.tryParse(map['audioDurationMs']?.toString() ?? ''),
       caption: map['caption']?.toString(),
+      reaction: map['reaction']?.toString().trim().isEmpty == true
+          ? null
+          : map['reaction']?.toString(),
+      replyToMessageId: map['replyToMessageId']?.toString(),
+      replyToPreview: map['replyToPreview']?.toString(),
     );
   }
 }
