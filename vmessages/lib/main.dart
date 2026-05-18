@@ -5,6 +5,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart'
@@ -74,8 +75,15 @@ Future<void> _setDarkMode(bool value) async {
   await prefs.setBool(_darkModePrefsKey, value);
 }
 
-class RootSessionGate extends StatelessWidget {
+class RootSessionGate extends StatefulWidget {
   const RootSessionGate({super.key});
+
+  @override
+  State<RootSessionGate> createState() => _RootSessionGateState();
+}
+
+class _RootSessionGateState extends State<RootSessionGate> {
+  bool _useBluetoothOnlyFallback = false;
 
   @override
   Widget build(BuildContext context) {
@@ -88,7 +96,42 @@ class RootSessionGate extends StatelessWidget {
       ),
       builder: (context, snapshot) {
         final session = snapshot.data?.session ?? client.auth.currentSession;
-        if (session == null) return const PhonePasswordAuthScreen();
+        if (session == null) {
+          if (_useBluetoothOnlyFallback) {
+            return const MessagesHomePage(bluetoothOnlyMode: true);
+          }
+          return CupertinoPageScaffold(
+            child: SafeArea(
+              child: Column(
+                children: [
+                  const Expanded(child: PhonePasswordAuthScreen()),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: CupertinoButton(
+                        onPressed: () {
+                          setState(() {
+                            _useBluetoothOnlyFallback = true;
+                          });
+                        },
+                        child: const Text('Usar solo Bluetooth (sin cuenta)'),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+        if (_useBluetoothOnlyFallback) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
+            setState(() {
+              _useBluetoothOnlyFallback = false;
+            });
+          });
+        }
         return AuthenticatedBootstrap(session: session);
       },
     );
@@ -318,6 +361,7 @@ class AuthenticatedBootstrap extends StatefulWidget {
 
 class _AuthenticatedBootstrapState extends State<AuthenticatedBootstrap> {
   late final Future<void> _bootstrapFuture;
+  bool _skipToBluetoothOnly = false;
 
   @override
   void initState() {
@@ -328,37 +372,61 @@ class _AuthenticatedBootstrapState extends State<AuthenticatedBootstrap> {
   Future<void> _ensureProfile() async {
     final user = widget.session.user;
     final phone = user.userMetadata?['phone']?.toString() ?? 'Sin telefono';
-    final profile = await Supabase.instance.client
-        .from('profiles')
-        .select('access_code,avatar_url')
-        .eq('id', user.id)
-        .maybeSingle();
-    await Supabase.instance.client.from('profiles').upsert({
-      'id': user.id,
-      'phone': phone,
-      'display_name': phone,
-      'access_code': profile?['access_code'],
-      'avatar_url': profile?['avatar_url'],
-    });
+    try {
+      final profile = await Supabase.instance.client
+          .from('profiles')
+          .select('access_code,avatar_url')
+          .eq('id', user.id)
+          .maybeSingle();
+      await Supabase.instance.client.from('profiles').upsert({
+        'id': user.id,
+        'phone': phone,
+        'display_name': phone,
+        'access_code': profile?['access_code'],
+        'avatar_url': profile?['avatar_url'],
+      });
+    } catch (e) {
+      // Permite iniciar sin internet; el perfil se sincroniza cuando vuelva la red.
+      debugPrint('Bootstrap de perfil en modo offline: $e');
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_skipToBluetoothOnly) {
+      return const MessagesHomePage(bluetoothOnlyMode: true);
+    }
     return FutureBuilder<void>(
       future: _bootstrapFuture,
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done) {
-          return const CupertinoPageScaffold(
-            child: Center(child: CupertinoActivityIndicator(radius: 14)),
-          );
-        }
-
-        if (snapshot.hasError) {
           return CupertinoPageScaffold(
-            child: Center(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text('Error iniciando perfil: ${snapshot.error}'),
+            child: SafeArea(
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const CupertinoActivityIndicator(radius: 14),
+                      const SizedBox(height: 14),
+                      const Text(
+                        'Conectando con Supabase...',
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 12),
+                      CupertinoButton(
+                        onPressed: () {
+                          if (!mounted) return;
+                          setState(() {
+                            _skipToBluetoothOnly = true;
+                          });
+                        },
+                        child: const Text('Saltar por ahora (usar Bluetooth)'),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ),
           );
@@ -371,7 +439,9 @@ class _AuthenticatedBootstrapState extends State<AuthenticatedBootstrap> {
 }
 
 class MessagesHomePage extends StatefulWidget {
-  const MessagesHomePage({super.key});
+  const MessagesHomePage({super.key, this.bluetoothOnlyMode = false});
+
+  final bool bluetoothOnlyMode;
 
   @override
   State<MessagesHomePage> createState() => _MessagesHomePageState();
@@ -381,7 +451,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   final _client = Supabase.instance.client;
   final _bluetoothService = BluetoothNearbyService.instance;
   bool _creatingChat = false;
-  late final Stream<List<Map<String, dynamic>>> _membershipStream;
+  late Stream<List<Map<String, dynamic>>> _membershipStream;
   Timer? _homeRefreshFallbackTimer;
   Timer? _iosBluetoothKeepAliveTimer;
   Timer? _iosBackgroundHeartbeatTimer;
@@ -405,6 +475,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   int _notificationIdCounter = 1000;
   final Set<String> _recentNotifiedMessageIds = <String>{};
   final List<String> _recentBtNotificationKeys = <String>[];
+  final Map<String, String> _notificationMediaFileCache = <String, String>{};
   static const String _btNotifDedupePrefsKey = 'bt_notif_dedupe_keys_v1';
   static const String _pendingWalkieInvitePrefsKey = 'bt_pending_walkie_invite_v1';
   bool _btNotifDedupeLoaded = false;
@@ -419,11 +490,15 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   String? _inAppMessageBannerBody;
   Timer? _inAppMessageBannerTimer;
 
-  String get _currentUserId => _client.auth.currentUser!.id;
+  String? get _currentUserId => _client.auth.currentUser?.id;
+  bool get _cloudChatEnabled =>
+      !widget.bluetoothOnlyMode && _currentUserId != null;
 
   Future<List<ConversationSummary>> _loadConversationSummaries(
     List<Map<String, dynamic>> membershipRows,
   ) async {
+    final me = _currentUserId;
+    if (me == null) return const [];
     final conversationIds = membershipRows
         .map((row) => row['conversation_id'].toString())
         .toList();
@@ -442,7 +517,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         .from('conversation_members')
         .select('conversation_id,user_id')
         .inFilter('conversation_id', conversationIds)
-        .neq('user_id', _currentUserId);
+        .neq('user_id', me);
 
     final otherUserByConversation = <String, String>{};
     final otherUserIds = <String>{};
@@ -506,7 +581,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
       final lastSenderId = lastMessage?['sender_id']?.toString();
       final hasUnread =
           lastAtUtc != null &&
-          lastSenderId != _currentUserId &&
+          lastSenderId != me &&
           (readAtUtc == null || lastAtUtc.isAfter(readAtUtc));
 
       summaries.add(
@@ -536,10 +611,21 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     super.initState();
     WidgetsBinding.instance.addObserver(_lifecycleObserver);
     _configureIncomingCallTonePlayer();
-    _membershipStream = _client
+    final baseMembershipStream = _client
         .from('conversation_members')
-        .stream(primaryKey: ['conversation_id', 'user_id'])
-        .eq('user_id', _currentUserId);
+        .stream(primaryKey: ['conversation_id', 'user_id']);
+    if (_cloudChatEnabled) {
+      _membershipStream = baseMembershipStream.map((rows) {
+        final me = _currentUserId;
+        if (me == null) return <Map<String, dynamic>>[];
+        return rows
+            .where((row) => row['user_id']?.toString() == me)
+            .map((row) => Map<String, dynamic>.from(row))
+            .toList();
+      });
+    } else {
+      _membershipStream = Stream.value(const <Map<String, dynamic>>[]);
+    }
     _homeRefreshFallbackTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
       setState(() {});
@@ -551,7 +637,9 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     _loadBtNotificationDedupeCache();
     _loadPendingWalkieInvite();
     _requestNotificationPermissions();
-    _resubscribeMessageNotifications(force: true);
+    if (_cloudChatEnabled) {
+      _resubscribeMessageNotifications(force: true);
+    }
   }
 
   @override
@@ -591,6 +679,109 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         _inAppMessageBannerBody = null;
       });
     });
+  }
+
+  Future<String?> _mediaPathFromUrl(String? url) async {
+    final clean = url?.trim() ?? '';
+    if (clean.isEmpty) return null;
+    final cached = _notificationMediaFileCache[clean];
+    if (cached != null && await File(cached).exists()) return cached;
+    try {
+      final uri = Uri.tryParse(clean);
+      if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+        return null;
+      }
+      final client = HttpClient();
+      final req = await client.getUrl(uri);
+      final res = await req.close();
+      if (res.statusCode < 200 || res.statusCode >= 300) return null;
+      final bytes = await consolidateHttpClientResponseBytes(res);
+      if (bytes.isEmpty) return null;
+      final dir = await _runtimeTempDir();
+      final path =
+          '${dir.path}/notif_media_${clean.hashCode}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final file = File(path);
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(bytes, flush: true);
+      _notificationMediaFileCache[clean] = path;
+      if (_notificationMediaFileCache.length > 80) {
+        _notificationMediaFileCache.remove(_notificationMediaFileCache.keys.first);
+      }
+      return path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<String?> _mediaPathFromBase64(String? base64Input) async {
+    final clean = base64Input?.trim() ?? '';
+    if (clean.isEmpty) return null;
+    final cacheKey = 'b64_${clean.hashCode}';
+    final cached = _notificationMediaFileCache[cacheKey];
+    if (cached != null && await File(cached).exists()) return cached;
+    try {
+      final bytes = base64Decode(clean);
+      if (bytes.isEmpty) return null;
+      final dir = await _runtimeTempDir();
+      final path =
+          '${dir.path}/notif_media_${clean.hashCode}_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final file = File(path);
+      await file.parent.create(recursive: true);
+      await file.writeAsBytes(bytes, flush: true);
+      _notificationMediaFileCache[cacheKey] = path;
+      if (_notificationMediaFileCache.length > 80) {
+        _notificationMediaFileCache.remove(_notificationMediaFileCache.keys.first);
+      }
+      return path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<(String, String?)> _messagePreviewAndPhotoPath(String rawBody) async {
+    if (!rawBody.startsWith('photo::')) {
+      final text = rawBody.trim().isEmpty ? 'Nuevo mensaje' : rawBody;
+      return (text, null);
+    }
+    try {
+      final payload = rawBody.replaceFirst('photo::', '');
+      final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+      final caption = map['caption']?.toString().trim() ?? '';
+      final url = map['url']?.toString().trim() ?? '';
+      final photoPath = await _mediaPathFromUrl(url.isEmpty ? null : url);
+      final text = caption.isEmpty ? '📷 Foto' : '📷 $caption';
+      return (text, photoPath);
+    } catch (_) {
+      return ('📷 Foto', null);
+    }
+  }
+
+  Future<(String, String?)> _bluetoothPreviewAndPhotoPath(String body) async {
+    final clean = body.trim();
+    if (clean.startsWith('btmsg::')) {
+      try {
+        final payload = clean.replaceFirst('btmsg::', '');
+        final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+        final type = map['type']?.toString() ?? '';
+        if (type == 'photo') {
+          final caption = map['caption']?.toString().trim() ?? '';
+          final bytesRaw = map['bytes']?.toString();
+          final path = await _mediaPathFromBase64(bytesRaw);
+          return (caption.isEmpty ? '📷 Foto' : '📷 $caption', path);
+        }
+      } catch (_) {}
+    }
+    if (clean.startsWith('btphoto::')) {
+      try {
+        final payload = clean.replaceFirst('btphoto::', '');
+        final map = Map<String, dynamic>.from(jsonDecode(payload) as Map);
+        final caption = map['caption']?.toString().trim() ?? '';
+        final bytesRaw = map['bytes']?.toString();
+        final path = await _mediaPathFromBase64(bytesRaw);
+        return (caption.isEmpty ? '📷 Foto' : '📷 $caption', path);
+      } catch (_) {}
+    }
+    return (_notificationPreviewFromBluetoothBody(body), null);
   }
 
   Future<void> _initBluetoothNearby() async {
@@ -737,8 +928,10 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   }
 
   void _subscribeMessageNotifications() {
+    final me = _currentUserId;
+    if (me == null) return;
     _messageNotificationsChannel = _client
-        .channel('messages-notify-$_currentUserId')
+        .channel('messages-notify-$me')
         .onPostgresChanges(
           event: PostgresChangeEvent.insert,
           schema: 'public',
@@ -767,12 +960,14 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     Map<String, dynamic> row,
   ) async {
     try {
+      final me = _currentUserId;
+      if (me == null) return;
       final messageId = row['id']?.toString() ?? '';
       if (messageId.isEmpty) return;
       if (_recentNotifiedMessageIds.contains(messageId)) return;
 
       final senderId = row['sender_id']?.toString() ?? '';
-      if (senderId == _currentUserId) return;
+      if (senderId == me) return;
       final conversationId = row['conversation_id']?.toString() ?? '';
       if (conversationId.isEmpty) return;
 
@@ -780,7 +975,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           .from('conversation_members')
           .select('conversation_id')
           .eq('conversation_id', conversationId)
-          .eq('user_id', _currentUserId)
+          .eq('user_id', me)
           .maybeSingle();
       if (membership == null) return;
 
@@ -795,11 +990,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           : (senderProfile?['phone']?.toString() ?? 'Nuevo mensaje');
 
       final rawBody = row['body']?.toString() ?? '';
-      final body = rawBody.startsWith('photo::')
-          ? '📷 Foto'
-          : rawBody.trim().isEmpty
-          ? 'Nuevo mensaje'
-          : rawBody;
+      final (body, photoPath) = await _messagePreviewAndPhotoPath(rawBody);
 
       if (_appLifecycleState == AppLifecycleState.resumed) {
         _showInAppMessageBanner(title: senderName, body: body);
@@ -810,16 +1001,44 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         return;
       }
 
-      const details = lnp.NotificationDetails(
+      final details = lnp.NotificationDetails(
+        android: photoPath == null
+            ? const lnp.AndroidNotificationDetails(
+                'vmessages_messages_v1',
+                'Messages',
+                channelDescription: 'Mensajes',
+                importance: lnp.Importance.high,
+                priority: lnp.Priority.high,
+              )
+            : lnp.AndroidNotificationDetails(
+                'vmessages_messages_v1',
+                'Messages',
+                channelDescription: 'Mensajes',
+                importance: lnp.Importance.high,
+                priority: lnp.Priority.high,
+                styleInformation: lnp.BigPictureStyleInformation(
+                  lnp.FilePathAndroidBitmap(photoPath),
+                ),
+              ),
         iOS: lnp.DarwinNotificationDetails(
           presentAlert: true,
           presentBadge: true,
           presentSound: true,
+          attachments: photoPath == null
+              ? null
+              : <lnp.DarwinNotificationAttachment>[
+                  lnp.DarwinNotificationAttachment(photoPath),
+                ],
         ),
         macOS: lnp.DarwinNotificationDetails(
           presentAlert: true,
           presentBadge: true,
           presentSound: true,
+          attachments: photoPath == null
+              ? null
+              : <lnp.DarwinNotificationAttachment>[
+                  lnp.DarwinNotificationAttachment(photoPath),
+                ],
         ),
       );
       _notificationIdCounter++;
@@ -860,7 +1079,7 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
           ? peer.deviceName.trim()
           : (peer.deviceId.trim().isEmpty ? 'Bluetooth' : peer.deviceId.trim());
 
-      final preview = _notificationPreviewFromBluetoothBody(body);
+      final (preview, photoPath) = await _bluetoothPreviewAndPhotoPath(body);
 
       if (_appLifecycleState == AppLifecycleState.resumed) {
         _showInAppMessageBanner(title: peerName, body: preview);
@@ -872,16 +1091,44 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
         return;
       }
 
-      const details = lnp.NotificationDetails(
+      final details = lnp.NotificationDetails(
+        android: photoPath == null
+            ? const lnp.AndroidNotificationDetails(
+                'vmessages_messages_v1',
+                'Messages',
+                channelDescription: 'Mensajes',
+                importance: lnp.Importance.high,
+                priority: lnp.Priority.high,
+              )
+            : lnp.AndroidNotificationDetails(
+                'vmessages_messages_v1',
+                'Messages',
+                channelDescription: 'Mensajes',
+                importance: lnp.Importance.high,
+                priority: lnp.Priority.high,
+                styleInformation: lnp.BigPictureStyleInformation(
+                  lnp.FilePathAndroidBitmap(photoPath),
+                ),
+              ),
         iOS: lnp.DarwinNotificationDetails(
           presentAlert: true,
           presentBadge: true,
           presentSound: true,
+          attachments: photoPath == null
+              ? null
+              : <lnp.DarwinNotificationAttachment>[
+                  lnp.DarwinNotificationAttachment(photoPath),
+                ],
         ),
         macOS: lnp.DarwinNotificationDetails(
           presentAlert: true,
           presentBadge: true,
           presentSound: true,
+          attachments: photoPath == null
+              ? null
+              : <lnp.DarwinNotificationAttachment>[
+                  lnp.DarwinNotificationAttachment(photoPath),
+                ],
         ),
       );
       _notificationIdCounter++;
@@ -2038,6 +2285,12 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
   }
 
   Future<void> _startNewChat() async {
+    if (!_cloudChatEnabled) {
+      await _showErrorDialog(
+        'Sin internet/sesion. Los chats por numero se habilitan al iniciar sesion.',
+      );
+      return;
+    }
     final phone = await _showPhoneInputDialog(context);
     if (phone == null || phone.trim().isEmpty) return;
 
@@ -2129,23 +2382,17 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = CupertinoTheme.of(context).brightness == Brightness.dark;
+    final msgBannerBg = isDark ? const Color(0xFF1F2A3A) : const Color(0xFFEAF2FF);
+    final msgBannerTitleColor = isDark
+        ? const Color(0xFF7CC0FF)
+        : const Color(0xFF0A84FF);
+    final msgBannerBodyColor = isDark
+        ? const Color(0xFFE5E5EA)
+        : const Color(0xFF1C1C1E);
     return CupertinoPageScaffold(
       navigationBar: CupertinoNavigationBar(
-        leading: CupertinoButton(
-          padding: EdgeInsets.zero,
-          onPressed: () async {
-            await Navigator.of(context).push(
-              CupertinoPageRoute<void>(
-                builder: (_) => const ProfileScreen(),
-              ),
-            );
-            await _loadMyBluetoothAvatarCache();
-            await _broadcastBluetoothPresence();
-          },
-          child: const Icon(CupertinoIcons.person_circle, size: 24),
-        ),
-        middle: const Text('Mensajes'),
-        trailing: Row(
+        leading: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             CupertinoButton(
@@ -2159,20 +2406,42 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
               },
               child: const Icon(CupertinoIcons.settings, size: 24),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: 8),
             CupertinoButton(
               padding: EdgeInsets.zero,
-              onPressed: _creatingChat ? null : _startNewChat,
+              onPressed: () async {
+                await Navigator.of(context).push(
+                  CupertinoPageRoute<void>(
+                    builder: (_) => const ProfileScreen(),
+                  ),
+                );
+                await _loadMyBluetoothAvatarCache();
+                await _broadcastBluetoothPresence();
+              },
+              child: const Icon(CupertinoIcons.person_circle, size: 24),
+            ),
+          ],
+        ),
+        middle: const Text('Mensajes'),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              onPressed: _cloudChatEnabled && !_creatingChat
+                  ? _startNewChat
+                  : null,
               child: _creatingChat
                   ? const CupertinoActivityIndicator(radius: 10)
                   : const Icon(CupertinoIcons.square_pencil, size: 24),
             ),
             const SizedBox(width: 10),
-            CupertinoButton(
-              padding: EdgeInsets.zero,
-              onPressed: () => _client.auth.signOut(),
-              child: const Icon(CupertinoIcons.square_arrow_right, size: 24),
-            ),
+            if (_cloudChatEnabled)
+              CupertinoButton(
+                padding: EdgeInsets.zero,
+                onPressed: () => _client.auth.signOut(),
+                child: const Icon(CupertinoIcons.square_arrow_right, size: 24),
+              ),
           ],
         ),
       ),
@@ -2190,15 +2459,15 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                     vertical: 10,
                   ),
                   decoration: BoxDecoration(
-                    color: const Color(0xFFEAF2FF),
+                    color: msgBannerBg,
                     borderRadius: BorderRadius.circular(12),
                   ),
                   child: Row(
                     children: [
-                      const Icon(
+                      Icon(
                         CupertinoIcons.bell_fill,
                         size: 18,
-                        color: Color(0xFF0A84FF),
+                        color: msgBannerTitleColor,
                       ),
                       const SizedBox(width: 8),
                       Expanded(
@@ -2209,10 +2478,10 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                               _inAppMessageBannerTitle!,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
+                              style: TextStyle(
                                 fontSize: 13,
                                 fontWeight: FontWeight.w700,
-                                color: Color(0xFF0A84FF),
+                                color: msgBannerTitleColor,
                               ),
                             ),
                             const SizedBox(height: 2),
@@ -2220,7 +2489,10 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                               _inAppMessageBannerBody!,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 12),
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: msgBannerBodyColor,
+                              ),
                             ),
                           ],
                         ),
@@ -2233,22 +2505,21 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
               child: StreamBuilder<List<Map<String, dynamic>>>(
                 stream: _membershipStream,
                 builder: (context, membershipSnapshot) {
-                  if (membershipSnapshot.hasError) {
-                    return Center(child: Text('Error: ${membershipSnapshot.error}'));
-                  }
-                  if (!membershipSnapshot.hasData) {
+                  final cloudError = membershipSnapshot.error;
+                  if (!membershipSnapshot.hasData && cloudError == null) {
                     return const Center(
                       child: CupertinoActivityIndicator(radius: 14),
                     );
                   }
 
-                  final membershipRows = membershipSnapshot.data!;
+                  final membershipRows =
+                      membershipSnapshot.data ?? const <Map<String, dynamic>>[];
                   final conversationIds = membershipRows
                       .map((row) => row['conversation_id'].toString())
                       .toList();
 
                   if (conversationIds.isEmpty && _visibleNearbyDevices().isEmpty) {
-                    return _buildHomePlaceholder();
+                    return _buildHomePlaceholder(cloudError: cloudError);
                   }
 
                   return FutureBuilder<List<ConversationSummary>>(
@@ -2267,6 +2538,21 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
                       final nearbyTiles = _buildNearbyChatTiles();
                       return ListView(
                         children: [
+                          if (cloudError != null)
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(14, 10, 14, 4),
+                              child: Text(
+                                'Sin internet: mostrando Bluetooth cercano.',
+                                style: TextStyle(
+                                  color: CupertinoDynamicColor.resolve(
+                                    CupertinoColors.systemOrange,
+                                    context,
+                                  ),
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
                           ...nearbyTiles,
                           ...summaries.map(_buildConversationTile),
                         ],
@@ -2282,13 +2568,47 @@ class _MessagesHomePageState extends State<MessagesHomePage> {
     );
   }
 
-  Widget _buildHomePlaceholder() {
+  Widget _buildHomePlaceholder({Object? cloudError}) {
     final nearbyTiles = _buildNearbyChatTiles();
     if (nearbyTiles.isNotEmpty) {
-      return ListView(children: nearbyTiles);
+      return ListView(
+        children: [
+          if (cloudError != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 10, 14, 4),
+              child: Text(
+                'Sin internet: mostrando Bluetooth cercano.',
+                style: TextStyle(
+                  color: CupertinoDynamicColor.resolve(
+                    CupertinoColors.systemOrange,
+                    context,
+                  ),
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ...nearbyTiles,
+        ],
+      );
     }
     return ListView(
       children: [
+        if (cloudError != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
+            child: Text(
+              'Sin internet. Activa la red o usa Bluetooth cercano.',
+              style: TextStyle(
+                color: CupertinoDynamicColor.resolve(
+                  CupertinoColors.systemOrange,
+                  context,
+                ),
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
         Center(
           child: Text(
             'Sin chats aun. Toca el icono para iniciar uno.',
@@ -2765,6 +3085,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final hasSession = _client.auth.currentSession != null;
     return CupertinoPageScaffold(
       navigationBar: const CupertinoNavigationBar(middle: Text('Perfil')),
       child: SafeArea(
@@ -2827,6 +3148,43 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     )
                   : const Text('Guardar codigo'),
             ),
+            if (hasSession) ...[
+              const SizedBox(height: 14),
+              CupertinoButton(
+                color: CupertinoColors.systemRed,
+                onPressed: () async {
+                  final confirm = await showCupertinoDialog<bool>(
+                    context: context,
+                    builder: (context) => CupertinoAlertDialog(
+                      title: const Text('Cerrar sesion'),
+                      content: const Text(
+                        'Se cerrara tu sesion de Supabase en este dispositivo.',
+                      ),
+                      actions: [
+                        CupertinoDialogAction(
+                          onPressed: () => Navigator.of(context).pop(false),
+                          child: const Text('Cancelar'),
+                        ),
+                        CupertinoDialogAction(
+                          isDestructiveAction: true,
+                          onPressed: () => Navigator.of(context).pop(true),
+                          child: const Text('Cerrar sesion'),
+                        ),
+                      ],
+                    ),
+                  );
+                  if (confirm == true) {
+                    await _client.auth.signOut();
+                    if (!context.mounted) return;
+                    Navigator.of(context).pop();
+                  }
+                },
+                child: const Text(
+                  'Cerrar sesion',
+                  style: TextStyle(color: CupertinoColors.white),
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -3310,6 +3668,14 @@ class _AnimatedMessageBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = CupertinoTheme.of(context).brightness == Brightness.dark;
+    final incomingBubbleColor = isDark
+        ? const Color(0xFF2C2C2E)
+        : const Color(0xFFE5E5EA);
+    final incomingTextColor = CupertinoDynamicColor.resolve(
+      CupertinoColors.label,
+      context,
+    );
     final body = row['body'].toString();
     final isSticker = body.startsWith('sticker::');
     final isPhoto = body.startsWith('photo::');
@@ -3333,7 +3699,7 @@ class _AnimatedMessageBubble extends StatelessWidget {
         maxWidth: MediaQuery.of(context).size.width * 0.76,
       ),
       decoration: BoxDecoration(
-        color: isMe ? const Color(0xFF0A84FF) : const Color(0xFFE5E5EA),
+        color: isMe ? const Color(0xFF0A84FF) : incomingBubbleColor,
         borderRadius: BorderRadius.circular(20),
       ),
       child: isPhoto
@@ -3343,8 +3709,8 @@ class _AnimatedMessageBubble extends StatelessWidget {
               style: TextStyle(
                 fontSize: isSticker ? 34 : 16,
                 color: isSticker
-                    ? const Color(0xFF1C1C1E)
-                    : (isMe ? CupertinoColors.white : const Color(0xFF1C1C1E)),
+                    ? incomingTextColor
+                    : (isMe ? CupertinoColors.white : incomingTextColor),
               ),
             ),
     );
@@ -3404,13 +3770,17 @@ class _PhotoBubbleContent extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final incomingTextColor = CupertinoDynamicColor.resolve(
+      CupertinoColors.label,
+      context,
+    );
     final photoUrl = photoData?['url']?.toString();
     final caption = photoData?['caption']?.toString().trim() ?? '';
     if (photoUrl == null || photoUrl.isEmpty) {
       return Text(
         'Foto no disponible',
         style: TextStyle(
-          color: isMe ? CupertinoColors.white : const Color(0xFF1C1C1E),
+          color: isMe ? CupertinoColors.white : incomingTextColor,
         ),
       );
     }
@@ -3434,7 +3804,7 @@ class _PhotoBubbleContent extends StatelessWidget {
             caption,
             style: TextStyle(
               fontSize: 14,
-              color: isMe ? CupertinoColors.white : const Color(0xFF1C1C1E),
+              color: isMe ? CupertinoColors.white : incomingTextColor,
             ),
           ),
         ],
@@ -3601,6 +3971,9 @@ class _MessageComposerState extends State<MessageComposer> {
 
   @override
   Widget build(BuildContext context) {
+    final isDark = CupertinoTheme.of(context).brightness == Brightness.dark;
+    final composerBg = isDark ? const Color(0xFF2C2C2E) : const Color(0xFFF2F2F7);
+    final stickerChipBg = isDark ? const Color(0xFF3A3A3C) : const Color(0xFFE9E9EE);
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -3609,7 +3982,7 @@ class _MessageComposerState extends State<MessageComposer> {
             margin: const EdgeInsets.fromLTRB(12, 10, 12, 0),
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
-              color: const Color(0xFFF2F2F7),
+              color: composerBg,
               borderRadius: BorderRadius.circular(14),
             ),
             child: Row(
@@ -3685,7 +4058,7 @@ class _MessageComposerState extends State<MessageComposer> {
                         final sticker = _stickers[index];
                         return CupertinoButton(
                           padding: const EdgeInsets.symmetric(horizontal: 10),
-                          color: const Color(0xFFE9E9EE),
+                          color: stickerChipBg,
                           borderRadius: BorderRadius.circular(14),
                           onPressed: _sending
                               ? null
@@ -3727,7 +4100,7 @@ class _MessageComposerState extends State<MessageComposer> {
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 14),
                   decoration: BoxDecoration(
-                    color: const Color(0xFFF2F2F7),
+                    color: composerBg,
                     borderRadius: BorderRadius.circular(22),
                   ),
                   child: CupertinoTextField(
@@ -4542,12 +4915,6 @@ class _BluetoothConversationScreenState
     if (lastIncoming.isNotEmpty) out.add(lastIncoming);
     final fallback = widget.deviceId.trim();
     if (fallback.isNotEmpty) out.add(fallback);
-    if (_peerPresence == 'background') {
-      for (final d in _liveNearbyDevices) {
-        final id = d.deviceId.trim();
-        if (id.isNotEmpty) out.add(id);
-      }
-    }
     return out.toList();
   }
 
@@ -4559,6 +4926,7 @@ class _BluetoothConversationScreenState
       } catch (_) {}
       try {
         await widget.service.sendText(target, payload);
+        return;
       } catch (_) {}
     }
   }
@@ -5521,7 +5889,7 @@ class _BluetoothConversationScreenState
       sentAt: DateTime.now(),
       photoBytes: null,
       audioBytes: null,
-      audioDurationMs: null,
+      audioDurationMs: null, 
       caption: null,
     );
   }
