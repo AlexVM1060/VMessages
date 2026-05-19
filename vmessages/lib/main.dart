@@ -4686,6 +4686,7 @@ class _BluetoothConversationScreenState
   String _onlinePeerDeviceId = '';
   String _backgroundPeerDeviceId = '';
   String _lastIncomingDeviceId = '';
+  String _lockedOutgoingPeerDeviceId = '';
   String? _peerAvatarBase64;
   String? _peerAvatarHash;
   bool _peerTyping = false;
@@ -4740,7 +4741,10 @@ class _BluetoothConversationScreenState
         if (!current.isMe) continue;
         if (current.messageId != id) continue;
         if (current.isDelivered) return true;
-        _messages[i] = current.copyWith(isDelivered: true);
+        _messages[i] = current.copyWith(
+          isDelivered: true,
+          deliveredAt: current.deliveredAt ?? DateTime.now(),
+        );
         _pendingDeliveryMessageIds.remove(id);
         _pendingPayloadByMessageId.remove(id);
         changed = true;
@@ -4773,7 +4777,12 @@ class _BluetoothConversationScreenState
         if (!current.isMe) continue;
         if (current.sentAt.isAfter(targetSentAt)) continue;
         if (current.isSeen) continue;
-        _messages[i] = current.copyWith(isDelivered: true, isSeen: true);
+        _messages[i] = current.copyWith(
+          isDelivered: true,
+          isSeen: true,
+          deliveredAt: current.deliveredAt ?? DateTime.now(),
+          seenAt: DateTime.now(),
+        );
         changed = true;
       }
       if (changed && mounted) {
@@ -4854,6 +4863,15 @@ class _BluetoothConversationScreenState
         sameAudioDuration;
   }
 
+  String _outgoingStatusLabel(_BluetoothChatMessage message) {
+    if (message.isSeen) {
+      final seenTime = _formatStatusTime12(message.seenAt);
+      return seenTime.isEmpty ? 'Visto' : 'Visto $seenTime';
+    }
+    final deliveredTime = _formatStatusTime12(message.deliveredAt);
+    return deliveredTime.isEmpty ? 'Entregado' : 'Entregado $deliveredTime';
+  }
+
   @override
   void initState() {
     super.initState();
@@ -4869,6 +4887,7 @@ class _BluetoothConversationScreenState
     }
     _peerAvatarBase64 = widget.peerAvatarBase64;
     _peerAvatarHash = widget.peerAvatarHash;
+    _lockedOutgoingPeerDeviceId = widget.deviceId.trim();
     WidgetsBinding.instance.addObserver(this);
     _loadLocalHistory();
     _liveNearbyDevices = widget.service.currentDevices;
@@ -4890,6 +4909,7 @@ class _BluetoothConversationScreenState
       final senderId = event.deviceId.trim();
       if (senderId.isNotEmpty) {
         _lastIncomingDeviceId = senderId;
+        _lockOutgoingPeerFromIncoming(senderId);
         if (_peerPresence == 'background') {
           _backgroundPeerDeviceId = senderId;
         } else {
@@ -5104,6 +5124,8 @@ class _BluetoothConversationScreenState
   }
 
   String _resolveOutgoingDeviceId() {
+    final locked = _lockedOutgoingPeerDeviceId.trim();
+    if (locked.isNotEmpty) return locked;
     final onlinePinned = _onlinePeerDeviceId.trim();
     final backgroundPinned = _backgroundPeerDeviceId.trim();
     if (_peerPresence == 'background' && backgroundPinned.isNotEmpty) {
@@ -5133,6 +5155,7 @@ class _BluetoothConversationScreenState
     });
     final resolved = matches.first.deviceId.trim();
     if (resolved.isNotEmpty) {
+      _lockedOutgoingPeerDeviceId = resolved;
       if (_peerPresence == 'background') {
         _backgroundPeerDeviceId = resolved;
       } else {
@@ -5158,16 +5181,41 @@ class _BluetoothConversationScreenState
   }
 
   Future<void> _sendTextSmart(String payload) async {
-    final targets = _candidateOutgoingPeerIds();
-    for (final target in targets) {
-      try {
-        await widget.service.invite(target, deviceName: widget.peerName);
-      } catch (_) {}
-      try {
-        await widget.service.sendText(target, payload);
-        return;
-      } catch (_) {}
+    final primary = _resolveOutgoingDeviceId().trim();
+    if (primary.isEmpty) return;
+    try {
+      await widget.service.invite(primary, deviceName: widget.peerName);
+    } catch (_) {}
+    try {
+      await widget.service.sendText(primary, payload);
+      return;
+    } catch (_) {}
+    final fallback = widget.deviceId.trim();
+    if (fallback.isEmpty || fallback == primary) return;
+    try {
+      await widget.service.invite(fallback, deviceName: widget.peerName);
+    } catch (_) {}
+    try {
+      await widget.service.sendText(fallback, payload);
+      _lockedOutgoingPeerDeviceId = fallback;
+    } catch (_) {}
+  }
+
+  void _lockOutgoingPeerFromIncoming(String senderId) {
+    final clean = senderId.trim();
+    if (clean.isEmpty) return;
+    _lockedOutgoingPeerDeviceId = clean;
+  }
+
+  void _lockOutgoingPeerFromPresence(String senderId, String state) {
+    final clean = senderId.trim();
+    if (clean.isEmpty) return;
+    if (state == 'background') {
+      _backgroundPeerDeviceId = clean;
+    } else {
+      _onlinePeerDeviceId = clean;
     }
+    _lockedOutgoingPeerDeviceId = clean;
   }
 
   Future<void> _send() async {
@@ -5598,6 +5646,7 @@ class _BluetoothConversationScreenState
         final incomingAvatarB64 = map['avatarB64']?.toString().trim();
         final incomingAvatarHash = map['avatarHash']?.toString().trim();
         final senderId = incomingDeviceId.trim();
+        _lockOutgoingPeerFromPresence(senderId, state);
         if (state == 'background') {
           final currentOnline = _onlinePeerDeviceId.trim();
           if (currentOnline.isEmpty) {
@@ -6825,13 +6874,40 @@ class _BluetoothConversationScreenState
                                             right: 6,
                                             bottom: 6,
                                           ),
-                                          child: Text(
-                                            message.isSeen ? 'Visto' : 'Entregado',
-                                            style: const TextStyle(
-                                              fontSize: 11,
-                                              color: Color(0xFF8E8E93),
-                                            ),
-                                          ),
+                                          child: message.isSeen
+                                              ? Text(
+                                                  _outgoingStatusLabel(message),
+                                                  style: const TextStyle(
+                                                    fontSize: 11,
+                                                    color: Color(0xFF8E8E93),
+                                                  ),
+                                                )
+                                              : Column(
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.end,
+                                                  children: [
+                                                    const Text(
+                                                      'Entregado',
+                                                      style: TextStyle(
+                                                        fontSize: 11,
+                                                        color: Color(
+                                                          0xFF8E8E93,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                    Text(
+                                                      _formatStatusTime12(
+                                                        message.deliveredAt,
+                                                      ),
+                                                      style: const TextStyle(
+                                                        fontSize: 11,
+                                                        color: Color(
+                                                          0xFF8E8E93,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
                                         ),
                                     ],
                                   ),
@@ -7259,8 +7335,9 @@ class BluetoothVoiceCallScreen extends StatefulWidget {
 }
 
 class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
-  static const int _callChunkMs = 900;
+  static const int _callChunkMs = 600;
   static const int _minBufferedChunksToStart = 1;
+  static const int _maxBufferedChunks = 6;
   final _recorder = AudioRecorder();
   final _player = AudioPlayer();
   StreamSubscription<BluetoothIncomingMessage>? _incomingSub;
@@ -7279,13 +7356,19 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
   int _txSeq = 0;
   final String _callId = DateTime.now().millisecondsSinceEpoch.toString();
   bool _endSignalHandled = false;
+  String _lockedPeerDeviceId = '';
 
   @override
   void initState() {
     super.initState();
     _peerAccepted = !widget.isInitiator;
+    _lockedPeerDeviceId = widget.deviceId.trim();
     _callStartedAt = DateTime.now();
     _incomingSub = widget.service.messagesStream.listen((event) {
+      final senderId = event.deviceId.trim();
+      if (senderId.isNotEmpty) {
+        _lockedPeerDeviceId = senderId;
+      }
       final raw = _extractBtEnvelopeVisibleText(event.message);
       if (!raw.startsWith('btvoicecall::')) return;
       try {
@@ -7326,6 +7409,9 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
             _recentIncomingSignatures.removeAt(0);
           }
           _incomingQueue.add(base64Decode(bytesRaw));
+          while (_incomingQueue.length > _maxBufferedChunks) {
+            _incomingQueue.removeAt(0);
+          }
           _playQueue();
           return;
         }
@@ -7358,16 +7444,13 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
 
   void _startInviteHandshake() {
     _handshakeTimer?.cancel();
-    _handshakeTimer = Timer.periodic(const Duration(milliseconds: 900), (_) {
+    _handshakeTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
       if (!_callActive || _peerAccepted) {
         _handshakeTimer?.cancel();
         _handshakeTimer = null;
         return;
       }
-      widget.service.sendText(
-        widget.deviceId,
-        'btvoicecall::${jsonEncode({'type': 'invite', 'callId': _callId})}',
-      );
+      _sendCallPayload('btvoicecall::${jsonEncode({'type': 'invite', 'callId': _callId})}');
     });
   }
 
@@ -7375,8 +7458,7 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
     for (var i = 0; i < 3; i++) {
       Future<void>.delayed(Duration(milliseconds: i * 220), () {
         if (!_callActive) return;
-        widget.service.sendText(
-          widget.deviceId,
+        _sendCallPayload(
           'btvoicecall::${jsonEncode({'type': 'accept', 'callId': _callId})}',
         );
       });
@@ -7430,7 +7512,7 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
           'durationMs': _callChunkMs,
           'bytes': base64Encode(bytes),
         });
-        await widget.service.sendText(widget.deviceId, 'btvoicecall::$payload');
+        await _sendCallPayload('btvoicecall::$payload');
       }
     } catch (_) {
     } finally {
@@ -7440,6 +7522,9 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
 
   Future<void> _playQueue() async {
     if (_playingIncoming || _incomingQueue.isEmpty || !_speakerEnabled) return;
+    while (_incomingQueue.length > _maxBufferedChunks) {
+      _incomingQueue.removeAt(0);
+    }
     if (_incomingQueue.length < _minBufferedChunksToStart) return;
     _playingIncoming = true;
     try {
@@ -7472,8 +7557,7 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
     setState(() {
       _callActive = false;
     });
-    await widget.service.sendText(
-      widget.deviceId,
+    await _sendCallPayload(
       'btvoicecall::${jsonEncode({'type': 'end', 'callId': _callId})}',
     );
     _endSignalHandled = true;
@@ -7485,8 +7569,7 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
   void dispose() {
     _callActive = false;
     if (!_endSignalHandled) {
-      widget.service.sendText(
-        widget.deviceId,
+      _sendCallPayload(
         'btvoicecall::${jsonEncode({'type': 'end', 'callId': _callId})}',
       );
     }
@@ -7496,6 +7579,30 @@ class _BluetoothVoiceCallScreenState extends State<BluetoothVoiceCallScreen> {
     _recorder.dispose();
     _player.dispose();
     super.dispose();
+  }
+
+  Future<void> _sendCallPayload(String payload) async {
+    final primary = _lockedPeerDeviceId.trim().isNotEmpty
+        ? _lockedPeerDeviceId.trim()
+        : widget.deviceId.trim();
+    if (primary.isNotEmpty) {
+      try {
+        await widget.service.invite(primary, deviceName: widget.peerName);
+      } catch (_) {}
+      try {
+        await widget.service.sendText(primary, payload);
+        return;
+      } catch (_) {}
+    }
+    final fallback = widget.deviceId.trim();
+    if (fallback.isEmpty || fallback == primary) return;
+    try {
+      await widget.service.invite(fallback, deviceName: widget.peerName);
+    } catch (_) {}
+    try {
+      await widget.service.sendText(fallback, payload);
+      _lockedPeerDeviceId = fallback;
+    } catch (_) {}
   }
 
   @override
@@ -8079,6 +8186,8 @@ class _BluetoothChatMessage {
     required this.isDelivered,
     required this.isSeen,
     required this.sentAt,
+    this.deliveredAt,
+    this.seenAt,
     required this.photoBytes,
     required this.audioBytes,
     required this.audioDurationMs,
@@ -8094,6 +8203,8 @@ class _BluetoothChatMessage {
   final bool isDelivered;
   final bool isSeen;
   final DateTime sentAt;
+  final DateTime? deliveredAt;
+  final DateTime? seenAt;
   final Uint8List? photoBytes;
   final Uint8List? audioBytes;
   final int? audioDurationMs;
@@ -8109,6 +8220,8 @@ class _BluetoothChatMessage {
     bool? isDelivered,
     bool? isSeen,
     DateTime? sentAt,
+    DateTime? deliveredAt,
+    DateTime? seenAt,
     Uint8List? photoBytes,
     Uint8List? audioBytes,
     int? audioDurationMs,
@@ -8125,6 +8238,8 @@ class _BluetoothChatMessage {
       isDelivered: isDelivered ?? this.isDelivered,
       isSeen: isSeen ?? this.isSeen,
       sentAt: sentAt ?? this.sentAt,
+      deliveredAt: deliveredAt ?? this.deliveredAt,
+      seenAt: seenAt ?? this.seenAt,
       photoBytes: photoBytes ?? this.photoBytes,
       audioBytes: audioBytes ?? this.audioBytes,
       audioDurationMs: audioDurationMs ?? this.audioDurationMs,
@@ -8143,6 +8258,8 @@ class _BluetoothChatMessage {
       'isDelivered': isDelivered,
       'isSeen': isSeen,
       'sentAt': sentAt.toIso8601String(),
+      'deliveredAt': deliveredAt?.toIso8601String(),
+      'seenAt': seenAt?.toIso8601String(),
       'photoBytes': photoBytes == null ? null : base64Encode(photoBytes!),
       'audioBytes': audioBytes == null ? null : base64Encode(audioBytes!),
       'audioDurationMs': audioDurationMs,
@@ -8160,6 +8277,10 @@ class _BluetoothChatMessage {
     final sentAt = sentAtRaw == null
         ? DateTime.now()
         : DateTime.tryParse(sentAtRaw) ?? DateTime.now();
+    final deliveredAt = DateTime.tryParse(
+      map['deliveredAt']?.toString() ?? '',
+    );
+    final seenAt = DateTime.tryParse(map['seenAt']?.toString() ?? '');
     final photoRaw = map['photoBytes']?.toString();
     final audioRaw = map['audioBytes']?.toString();
     Uint8List? decodedPhoto;
@@ -8187,6 +8308,8 @@ class _BluetoothChatMessage {
       isDelivered: map['isDelivered'] == true || map['isMe'] != true,
       isSeen: map['isSeen'] == true || map['isMe'] != true,
       sentAt: sentAt,
+      deliveredAt: deliveredAt,
+      seenAt: seenAt,
       photoBytes: decodedPhoto,
       audioBytes: decodedAudio,
       audioDurationMs: map['audioDurationMs'] is int
@@ -8303,6 +8426,16 @@ String _formatTime(DateTime timestamp) {
   final hour = timestamp.hour.toString().padLeft(2, '0');
   final minute = timestamp.minute.toString().padLeft(2, '0');
   return '$hour:$minute';
+}
+
+String _formatStatusTime12(DateTime? timestamp) {
+  if (timestamp == null) return '';
+  final hour24 = timestamp.hour;
+  final minute = timestamp.minute.toString().padLeft(2, '0');
+  final isPm = hour24 >= 12;
+  final hour12 = hour24 % 12 == 0 ? 12 : hour24 % 12;
+  final suffix = isPm ? 'p.m.' : 'a.m.';
+  return '$hour12:$minute $suffix';
 }
 
 Future<Directory> _runtimeTempDir() async {
